@@ -1,0 +1,3 @@
+spring:
+  application:
+    name: coffee-point-order-system
