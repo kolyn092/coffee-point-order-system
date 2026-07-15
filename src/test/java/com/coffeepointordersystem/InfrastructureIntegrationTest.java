@@ -6,27 +6,39 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.core.env.Environment;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.UncategorizedSQLException;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.data.redis.core.RedisCallback;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.MySQLContainer;
+import org.testcontainers.containers.wait.strategy.Wait;
+import org.testcontainers.utility.DockerImageName;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
-@Testcontainers(disabledWithoutDocker = true)
+@Testcontainers
 @SpringBootTest
 class InfrastructureIntegrationTest {
+	private static final int KAFKA_PORT = 9092;
 	private static final long TEST_MENU_ID = 100L;
 	private static final String TEST_USER_ID = "m0-test-user";
 	private static final Instant TEST_ORDERED_AT = Instant.parse("2026-07-15T03:04:05.123456Z");
+	private static final DockerImageName REDIS_IMAGE = DockerImageName.parse("redis:7.2-alpine");
+	private static final DockerImageName KAFKA_IMAGE = DockerImageName.parse("apache/kafka:3.9.0");
 
 	@Container
 	static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.0.36")
@@ -34,17 +46,30 @@ class InfrastructureIntegrationTest {
 			.withUsername("test")
 			.withPassword("test");
 
+	@Container
+	static final GenericContainer<?> REDIS = new GenericContainer<>(REDIS_IMAGE)
+			.withExposedPorts(6379);
+
+	@Container
+	static final LocalKafkaContainer KAFKA = new LocalKafkaContainer(KAFKA_IMAGE);
+
 	@Autowired
 	private JdbcTemplate jdbcTemplate;
 
 	@Autowired
 	private Environment environment;
 
+	@Autowired
+	private StringRedisTemplate stringRedisTemplate;
+
 	@DynamicPropertySource
 	static void registerDatabaseProperties(DynamicPropertyRegistry registry) {
 		registry.add("spring.datasource.url", MYSQL::getJdbcUrl);
 		registry.add("spring.datasource.username", MYSQL::getUsername);
 		registry.add("spring.datasource.password", MYSQL::getPassword);
+		registry.add("spring.data.redis.host", REDIS::getHost);
+		registry.add("spring.data.redis.port", REDIS::getFirstMappedPort);
+		registry.add("spring.kafka.bootstrap-servers", KAFKA::getBootstrapServers);
 	}
 
 	@AfterEach
@@ -60,6 +85,22 @@ class InfrastructureIntegrationTest {
 				.isEqualTo("coffee-point-order-system");
 		assertThat(environment.getProperty("spring.jpa.properties.hibernate.jdbc.time_zone"))
 				.isEqualTo("UTC");
+	}
+
+	@Test
+	void applicationContext_connectsRedisAndKafka() throws Exception {
+		String redisResponse = stringRedisTemplate.execute(
+				(RedisCallback<String>) connection -> connection.ping()
+		);
+
+		assertThat(redisResponse).isEqualTo("PONG");
+
+		try (AdminClient adminClient = AdminClient.create(Map.of(
+				AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG,
+				environment.getRequiredProperty("spring.kafka.bootstrap-servers")
+		))) {
+			assertThat(adminClient.describeCluster().nodes().get(10, TimeUnit.SECONDS)).isNotEmpty();
+		}
 	}
 
 	@Test
@@ -198,6 +239,28 @@ class InfrastructureIntegrationTest {
 		)).isInstanceOf(DataIntegrityViolationException.class);
 	}
 
+	@Test
+	void schema_restrictsReferencedMenuUpdate() {
+		insertValidOrder();
+
+		assertThatThrownBy(() -> jdbcTemplate.update(
+				"UPDATE menus SET id = ? WHERE id = ?",
+				TEST_MENU_ID + 1L,
+				TEST_MENU_ID
+		)).isInstanceOf(DataIntegrityViolationException.class);
+	}
+
+	@Test
+	void schema_restrictsReferencedPointAccountUpdate() {
+		insertValidOrder();
+
+		assertThatThrownBy(() -> jdbcTemplate.update(
+				"UPDATE point_accounts SET user_id = ? WHERE user_id = ?",
+				"m0-renamed-user",
+				TEST_USER_ID
+		)).isInstanceOf(DataIntegrityViolationException.class);
+	}
+
 	private void insertValidReferences() {
 		insertMenu(TEST_MENU_ID, "테스트 메뉴", 4500L);
 		insertPointAccount(TEST_USER_ID, 4500L);
@@ -233,5 +296,35 @@ class InfrastructureIntegrationTest {
 				paidAmount,
 				Timestamp.from(TEST_ORDERED_AT)
 		);
+	}
+
+	private static final class LocalKafkaContainer extends GenericContainer<LocalKafkaContainer> {
+		private LocalKafkaContainer(DockerImageName imageName) {
+			super(imageName);
+			addFixedExposedPort(KAFKA_PORT, KAFKA_PORT);
+			withEnv(Map.ofEntries(
+					Map.entry("CLUSTER_ID", "4L6g3nShT-eMCtK--X86sw"),
+					Map.entry("KAFKA_NODE_ID", "1"),
+					Map.entry("KAFKA_PROCESS_ROLES", "broker,controller"),
+					Map.entry(
+							"KAFKA_LISTENER_SECURITY_PROTOCOL_MAP",
+							"CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+					),
+					Map.entry("KAFKA_LISTENERS", "CONTROLLER://:9093,PLAINTEXT://:9092"),
+					Map.entry("KAFKA_ADVERTISED_LISTENERS", "PLAINTEXT://localhost:9092"),
+					Map.entry("KAFKA_INTER_BROKER_LISTENER_NAME", "PLAINTEXT"),
+					Map.entry("KAFKA_CONTROLLER_LISTENER_NAMES", "CONTROLLER"),
+					Map.entry("KAFKA_CONTROLLER_QUORUM_VOTERS", "1@localhost:9093"),
+					Map.entry("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1"),
+					Map.entry("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1"),
+					Map.entry("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1"),
+					Map.entry("KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", "0")
+			));
+			waitingFor(Wait.forLogMessage(".*Transitioning from RECOVERY to RUNNING.*", 1));
+		}
+
+		public String getBootstrapServers() {
+			return "localhost:" + KAFKA_PORT;
+		}
 	}
 }
