@@ -25,7 +25,7 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.MySQLContainer;
-import org.testcontainers.containers.wait.strategy.Wait;
+import org.testcontainers.kafka.KafkaContainer;
 import org.testcontainers.utility.DockerImageName;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -33,12 +33,10 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 @Testcontainers
 @SpringBootTest
 class InfrastructureIntegrationTest {
-	private static final int KAFKA_PORT = 9092;
 	private static final long TEST_MENU_ID = 100L;
 	private static final String TEST_USER_ID = "m0-test-user";
 	private static final Instant TEST_ORDERED_AT = Instant.parse("2026-07-15T03:04:05.123456Z");
 	private static final DockerImageName REDIS_IMAGE = DockerImageName.parse("redis:7.2-alpine");
-	private static final DockerImageName KAFKA_IMAGE = DockerImageName.parse("apache/kafka:3.9.0");
 
 	@Container
 	static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.0.36")
@@ -51,7 +49,7 @@ class InfrastructureIntegrationTest {
 			.withExposedPorts(6379);
 
 	@Container
-	static final LocalKafkaContainer KAFKA = new LocalKafkaContainer(KAFKA_IMAGE);
+	static final KafkaContainer KAFKA = new KafkaContainer(DockerImageName.parse("apache/kafka-native:3.8.0"));
 
 	@Autowired
 	private JdbcTemplate jdbcTemplate;
@@ -298,33 +296,4 @@ class InfrastructureIntegrationTest {
 		);
 	}
 
-	private static final class LocalKafkaContainer extends GenericContainer<LocalKafkaContainer> {
-		private LocalKafkaContainer(DockerImageName imageName) {
-			super(imageName);
-			addFixedExposedPort(KAFKA_PORT, KAFKA_PORT);
-			withEnv(Map.ofEntries(
-					Map.entry("CLUSTER_ID", "4L6g3nShT-eMCtK--X86sw"),
-					Map.entry("KAFKA_NODE_ID", "1"),
-					Map.entry("KAFKA_PROCESS_ROLES", "broker,controller"),
-					Map.entry(
-							"KAFKA_LISTENER_SECURITY_PROTOCOL_MAP",
-							"CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
-					),
-					Map.entry("KAFKA_LISTENERS", "CONTROLLER://:9093,PLAINTEXT://:9092"),
-					Map.entry("KAFKA_ADVERTISED_LISTENERS", "PLAINTEXT://localhost:9092"),
-					Map.entry("KAFKA_INTER_BROKER_LISTENER_NAME", "PLAINTEXT"),
-					Map.entry("KAFKA_CONTROLLER_LISTENER_NAMES", "CONTROLLER"),
-					Map.entry("KAFKA_CONTROLLER_QUORUM_VOTERS", "1@localhost:9093"),
-					Map.entry("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1"),
-					Map.entry("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1"),
-					Map.entry("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1"),
-					Map.entry("KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", "0")
-			));
-			waitingFor(Wait.forLogMessage(".*Transitioning from RECOVERY to RUNNING.*", 1));
-		}
-
-		public String getBootstrapServers() {
-			return "localhost:" + KAFKA_PORT;
-		}
-	}
 }
