@@ -1,3 +1,37 @@
 spring:
   application:
     name: coffee-point-order-system
+  datasource:
+    url: "jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:coffee_point_order}"
+    username: ${DB_USERNAME:coffee}
+    password: ${DB_PASSWORD:coffee}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      connection-init-sql: "SET time_zone = '+00:00'"
+      data-source-properties:
+        characterEncoding: UTF-8
+        connectionTimeZone: UTC
+        forceConnectionTimeZoneToSession: true
+        useUnicode: true
+  jpa:
+    open-in-view: false
+    database-platform: org.hibernate.dialect.MySQLDialect
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:29092}
+    admin:
+      auto-create: false
+  jackson:
+    time-zone: UTC
