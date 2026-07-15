@@ -142,7 +142,7 @@ API 요청·응답과 오류는 `docs/API.md`, 데이터 모델과 DB 제약은 
 
 | 단계 | 범위 | 완료 의미 |
 | --- | --- | --- |
-| P0 | 네 API, MySQL, Kafka, Redis, Compose | 기본 주문·인기 메뉴 흐름이 동작한다. |
+| P0 | API, MySQL, Kafka, Redis, Compose | 기본 주문·인기 메뉴 흐름이 동작한다. |
 | P1 | Outbox, 재시도와 consumer 중복 방지 | 이벤트 유실·중복에 대응한다. |
 | P2 | 성능 측정, Redis 복구와 운영 관측 | 병목과 장애 복구를 개선한다. |
 
