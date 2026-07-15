@@ -55,7 +55,7 @@ PRD의 `M<번호>`를 이슈 개수, 제목 또는 분해 단위로 강제하지
 1. `git status`, 현재 브랜치와 원격 저장소를 확인하고 기준 문서가 커밋되어 GitHub에서 열리는지 검증한다.
 2. `gh issue list --state all`로 기존·중복 이슈와 선행 단계 상태를 확인한다.
 3. 생성 대상마다 제목, 본문, 라벨과 의존 관계 초안을 작성해 사용자에게 한 번에 확인받는다.
-4. `gh label list --limit 200`으로 템플릿의 `type:feature` 또는 `type:bug` 라벨을 확인한다.
+4. `gh label list --limit 200`으로 템플릿의 `feature` 또는 `bug` 라벨을 확인한다.
 5. 확인된 초안을 임시 파일에 작성하고 `gh issue create --body-file`로 순서대로 생성한다.
 6. 생성 직후 `gh issue view`로 본문, 라벨과 링크를 검증하고 다음 이슈에 실제 번호를 연결한다.
 
