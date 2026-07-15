@@ -127,6 +127,15 @@ class PointIntegrationTest {
 	}
 
 	@Test
+	void chargePoint_returnsInvalidRequestForUnsupportedContentType() throws Exception {
+		mockMvc.perform(post("/api/v1/points/charges")
+					.contentType(MediaType.TEXT_PLAIN)
+					.content("{\"userId\": \"point-integration-user\", \"amount\": 10000}"))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.code").value("INVALID_REQUEST"));
+	}
+
+	@Test
 	void chargePoint_returnsConflictAndPreservesBalanceWhenAdditionOverflows() throws Exception {
 		jdbcTemplate.update(
 				"UPDATE point_accounts SET balance = ? WHERE user_id = ?",

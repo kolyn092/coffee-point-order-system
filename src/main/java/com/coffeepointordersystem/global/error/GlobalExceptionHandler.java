@@ -2,11 +2,12 @@ package com.coffeepointordersystem.global.error;
 
 import com.coffeepointordersystem.domain.point.exception.PointBalanceLimitExceededException;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingRequestValueException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
-import org.springframework.http.converter.HttpMessageNotReadableException;
 
 @RestControllerAdvice
 public class GlobalExceptionHandler {
@@ -14,6 +15,7 @@ public class GlobalExceptionHandler {
 	@ExceptionHandler({
 			MethodArgumentNotValidException.class,
 			HttpMessageNotReadableException.class,
+			HttpMediaTypeNotSupportedException.class,
 			MissingRequestValueException.class
 	})
 	public ResponseEntity<ErrorResponse> handleInvalidRequest(Exception exception) {
