@@ -1,0 +1,237 @@
+package com.coffeepointordersystem;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import java.sql.Timestamp;
+import java.time.Instant;
+import java.util.List;
+
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.core.env.Environment;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.jdbc.UncategorizedSQLException;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.containers.MySQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+
+@Testcontainers(disabledWithoutDocker = true)
+@SpringBootTest
+class InfrastructureIntegrationTest {
+	private static final long TEST_MENU_ID = 100L;
+	private static final String TEST_USER_ID = "m0-test-user";
+	private static final Instant TEST_ORDERED_AT = Instant.parse("2026-07-15T03:04:05.123456Z");
+
+	@Container
+	static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.0.36")
+			.withDatabaseName("coffee_point_order")
+			.withUsername("test")
+			.withPassword("test");
+
+	@Autowired
+	private JdbcTemplate jdbcTemplate;
+
+	@Autowired
+	private Environment environment;
+
+	@DynamicPropertySource
+	static void registerDatabaseProperties(DynamicPropertyRegistry registry) {
+		registry.add("spring.datasource.url", MYSQL::getJdbcUrl);
+		registry.add("spring.datasource.username", MYSQL::getUsername);
+		registry.add("spring.datasource.password", MYSQL::getPassword);
+	}
+
+	@AfterEach
+	void cleanUpTestData() {
+		jdbcTemplate.update("DELETE FROM orders WHERE user_id = ?", TEST_USER_ID);
+		jdbcTemplate.update("DELETE FROM point_accounts WHERE user_id = ?", TEST_USER_ID);
+		jdbcTemplate.update("DELETE FROM menus WHERE id = ?", TEST_MENU_ID);
+	}
+
+	@Test
+	void applicationContext_startsWithMySqlConfiguration() {
+		assertThat(environment.getProperty("spring.application.name"))
+				.isEqualTo("coffee-point-order-system");
+		assertThat(environment.getProperty("spring.jpa.properties.hibernate.jdbc.time_zone"))
+				.isEqualTo("UTC");
+	}
+
+	@Test
+	void flywayMigration_createsExpectedTablesAndInitialMenus() {
+		Long tableCount = jdbcTemplate.queryForObject(
+				"""
+						SELECT COUNT(*)
+						FROM information_schema.tables
+						WHERE table_schema = DATABASE()
+						  AND table_name IN ('menus', 'point_accounts', 'orders')
+						""",
+				Long.class
+		);
+
+		assertThat(tableCount).isEqualTo(3L);
+		assertThat(jdbcTemplate.queryForList(
+				"SELECT name FROM menus ORDER BY id",
+				String.class
+		)).containsExactly("아메리카노", "카페라떼");
+		assertThat(jdbcTemplate.queryForList(
+				"SELECT price FROM menus ORDER BY id",
+				Long.class
+		)).containsExactly(4500L, 5000L);
+	}
+
+	@Test
+	void schema_preservesOrderTimestampPrecisionAndUtcSession() {
+		insertValidReferences();
+		insertOrder(TEST_USER_ID, TEST_MENU_ID, 4500L);
+
+		String sessionTimeZone = jdbcTemplate.queryForObject(
+				"SELECT @@session.time_zone",
+				String.class
+		);
+		String storedTimestamp = jdbcTemplate.queryForObject(
+				"SELECT DATE_FORMAT(ordered_at, '%Y-%m-%d %H:%i:%s.%f') "
+						+ "FROM orders WHERE user_id = ?",
+				String.class,
+				TEST_USER_ID
+		);
+
+		assertThat(sessionTimeZone).isIn("UTC", "+00:00");
+		assertThat(environment.getProperty("spring.datasource.hikari.connection-init-sql"))
+				.isEqualTo("SET time_zone = '+00:00'");
+		assertThat(environment.getProperty(
+				"spring.datasource.hikari.data-source-properties.connectionTimeZone"
+		)).isEqualTo("UTC");
+		assertThat(storedTimestamp).isEqualTo("2026-07-15 03:04:05.123456");
+		assertThat(jdbcTemplate.queryForObject(
+				"SELECT datetime_precision FROM information_schema.columns "
+						+ "WHERE table_schema = DATABASE() AND table_name = 'orders' "
+						+ "AND column_name = 'ordered_at'",
+				Integer.class
+		)).isEqualTo(6);
+	}
+
+	@Test
+	void schema_rejectsBlankMenuName() {
+		assertThatThrownBy(() -> insertMenu(TEST_MENU_ID, "   ", 4500L))
+				.isInstanceOf(UncategorizedSQLException.class)
+				.hasMessageContaining("Check constraint");
+	}
+
+	@Test
+	void schema_rejectsNonPositiveMenuPrice() {
+		assertThatThrownBy(() -> insertMenu(TEST_MENU_ID, "테스트 메뉴", 0L))
+				.isInstanceOf(UncategorizedSQLException.class)
+				.hasMessageContaining("Check constraint");
+	}
+
+	@Test
+	void schema_rejectsNegativePointBalance() {
+		assertThatThrownBy(() -> insertPointAccount(TEST_USER_ID, -1L))
+				.isInstanceOf(UncategorizedSQLException.class)
+				.hasMessageContaining("Check constraint");
+	}
+
+	@Test
+	void schema_rejectsNonPositiveOrderAmount() {
+		insertValidReferences();
+
+		assertThatThrownBy(() -> insertOrder(TEST_USER_ID, TEST_MENU_ID, 0L))
+				.isInstanceOf(UncategorizedSQLException.class)
+				.hasMessageContaining("Check constraint");
+	}
+
+	@Test
+	void schema_rejectsOrderWithMissingMenu() {
+		insertPointAccount(TEST_USER_ID, 4500L);
+
+		assertThatThrownBy(() -> insertOrder(TEST_USER_ID, 999L, 4500L))
+				.isInstanceOf(DataIntegrityViolationException.class);
+	}
+
+	@Test
+	void schema_rejectsOrderWithMissingPointAccount() {
+		insertMenu(TEST_MENU_ID, "테스트 메뉴", 4500L);
+
+		assertThatThrownBy(() -> insertOrder("m0-missing-account", TEST_MENU_ID, 4500L))
+				.isInstanceOf(DataIntegrityViolationException.class);
+	}
+
+	@Test
+	void schema_createsRequiredOrderIndexes() {
+		List<String> indexNames = jdbcTemplate.queryForList(
+				"SELECT DISTINCT index_name FROM information_schema.statistics "
+						+ "WHERE table_schema = DATABASE() AND table_name = 'orders'",
+				String.class
+		);
+
+		assertThat(indexNames).contains(
+				"PRIMARY",
+				"idx_orders_user_id",
+				"idx_orders_menu_id",
+				"idx_orders_ordered_at_menu_id"
+		);
+	}
+
+	@Test
+	void schema_restrictsReferencedMenuDeletion() {
+		insertValidOrder();
+
+		assertThatThrownBy(() -> jdbcTemplate.update(
+				"DELETE FROM menus WHERE id = ?",
+				TEST_MENU_ID
+		)).isInstanceOf(DataIntegrityViolationException.class);
+	}
+
+	@Test
+	void schema_restrictsReferencedPointAccountDeletion() {
+		insertValidOrder();
+
+		assertThatThrownBy(() -> jdbcTemplate.update(
+				"DELETE FROM point_accounts WHERE user_id = ?",
+				TEST_USER_ID
+		)).isInstanceOf(DataIntegrityViolationException.class);
+	}
+
+	private void insertValidReferences() {
+		insertMenu(TEST_MENU_ID, "테스트 메뉴", 4500L);
+		insertPointAccount(TEST_USER_ID, 4500L);
+	}
+
+	private void insertValidOrder() {
+		insertValidReferences();
+		insertOrder(TEST_USER_ID, TEST_MENU_ID, 4500L);
+	}
+
+	private void insertMenu(long menuId, String name, long price) {
+		jdbcTemplate.update(
+				"INSERT INTO menus (id, name, price) VALUES (?, ?, ?)",
+				menuId,
+				name,
+				price
+		);
+	}
+
+	private void insertPointAccount(String userId, long balance) {
+		jdbcTemplate.update(
+				"INSERT INTO point_accounts (user_id, balance) VALUES (?, ?)",
+				userId,
+				balance
+		);
+	}
+
+	private void insertOrder(String userId, long menuId, long paidAmount) {
+		jdbcTemplate.update(
+				"INSERT INTO orders (user_id, menu_id, paid_amount, ordered_at) VALUES (?, ?, ?, ?)",
+				userId,
+				menuId,
+				paidAmount,
+				Timestamp.from(TEST_ORDERED_AT)
+		);
+	}
+}
