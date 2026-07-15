@@ -234,7 +234,7 @@ Accept: application/json
 
 | HTTP Status | Code | Description |
 | --- | --- | --- |
-| 400 | `INVALID_REQUEST` | `userId` 또는 `amount`가 공통 입력 규칙을 위반함 |
+| 400 | `INVALID_REQUEST` | `Content-Type`, 요청 JSON, `userId` 또는 `amount`가 공통 입력 규칙을 위반함 |
 | 409 | `POINT_BALANCE_LIMIT_EXCEEDED` | 충전 후 잔액이 signed 64-bit 범위를 초과함 |
 | 500 | `INTERNAL_SERVER_ERROR` | 공개 가능한 도메인 오류로 분류되지 않은 서버 오류 |
 
