@@ -196,11 +196,13 @@ Accept: application/json
 
 ### 처리 규칙
 
-- 해당 사용자의 첫 성공 충전이면 포인트 계정을 생성한다.
+- 외부 회원 시스템의 사용자 등록 과정에서 포인트 계정은 잔액 0으로 생성되어 있어야 한다. 이 API는 계정을
+  생성하지 않는다.
 - 같은 사용자의 충전과 주문은 포인트 계정 행에 대한 DB 비관적 잠금으로 직렬화한다.
 - 충전 전 잔액과 `amount`의 합은 checked arithmetic으로 계산한다.
 - 동시 충전이 성공하면 어느 요청도 유실되지 않으며 최종 잔액은 성공한 충전 금액의 합과 같다.
 - 같은 요청을 다시 보내면 새로운 충전으로 처리한다.
+- 포인트 계정이 없으면 회원 시스템과의 데이터 정합성이 깨진 것이므로 `INTERNAL_SERVER_ERROR`를 반환한다.
 
 ### Response
 
@@ -232,7 +234,7 @@ Accept: application/json
 
 | HTTP Status | Code | Description |
 | --- | --- | --- |
-| 400 | `INVALID_REQUEST` | `userId` 또는 `amount`가 공통 입력 규칙을 위반함 |
+| 400 | `INVALID_REQUEST` | `Content-Type`, 요청 JSON, `userId` 또는 `amount`가 공통 입력 규칙을 위반함 |
 | 409 | `POINT_BALANCE_LIMIT_EXCEEDED` | 충전 후 잔액이 signed 64-bit 범위를 초과함 |
 | 500 | `INTERNAL_SERVER_ERROR` | 공개 가능한 도메인 오류로 분류되지 않은 서버 오류 |
 
