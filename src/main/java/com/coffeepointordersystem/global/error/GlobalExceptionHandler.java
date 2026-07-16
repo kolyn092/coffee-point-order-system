@@ -1,6 +1,9 @@
 package com.coffeepointordersystem.global.error;
 
+import com.coffeepointordersystem.domain.menu.exception.MenuNotFoundException;
+import com.coffeepointordersystem.domain.point.exception.InsufficientPointBalanceException;
 import com.coffeepointordersystem.domain.point.exception.PointBalanceLimitExceededException;
+import com.coffeepointordersystem.domain.point.exception.PointAccountNotFoundException;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.HttpMediaTypeNotSupportedException;
@@ -27,6 +30,23 @@ public class GlobalExceptionHandler {
 			PointBalanceLimitExceededException exception
 	) {
 		return toResponseEntity(ErrorCode.POINT_BALANCE_LIMIT_EXCEEDED);
+	}
+
+	@ExceptionHandler(MenuNotFoundException.class)
+	public ResponseEntity<ErrorResponse> handleMenuNotFound(MenuNotFoundException exception) {
+		return toResponseEntity(ErrorCode.MENU_NOT_FOUND);
+	}
+
+	@ExceptionHandler(PointAccountNotFoundException.class)
+	public ResponseEntity<ErrorResponse> handlePointAccountNotFound(PointAccountNotFoundException exception) {
+		return toResponseEntity(ErrorCode.POINT_ACCOUNT_NOT_FOUND);
+	}
+
+	@ExceptionHandler(InsufficientPointBalanceException.class)
+	public ResponseEntity<ErrorResponse> handleInsufficientPointBalance(
+			InsufficientPointBalanceException exception
+	) {
+		return toResponseEntity(ErrorCode.INSUFFICIENT_POINT_BALANCE);
 	}
 
 	@ExceptionHandler(Exception.class)
