@@ -74,10 +74,10 @@ MySQL을 메뉴, 포인트 계정과 주문의 단일 원본으로 사용한다.
 
 ### 이벤트와 조회 모델
 
-Kafka는 주문 트랜잭션 commit 후 `order.completed` 이벤트를 전달하는 인프라이고, Redis는 일자별
-Sorted Set으로 인기 메뉴를 조회하는 파생 모델이다. M0에서는 연결 기반만 준비하고 주문 이벤트
-발행·소비 로직은 후속 마일스톤에서 구현한다. P0의 Redis 장애는 실패로 처리하며, MySQL fallback과
-Redis 재구성은 P2에서 도입한다.
+Kafka는 주문 트랜잭션 commit 후 `order.completed` 이벤트를 한 번 발행하는 인프라이고, Redis는 일자별
+Sorted Set으로 인기 메뉴를 조회하는 파생 모델이다. M3에서는 Mock consumer 통합 테스트로 주문 완료
+이벤트의 필수 필드 수신을 검증한다. 인기 메뉴 consumer와 Redis 반영은 M4에서 구현한다. P0의 Redis
+장애는 실패로 처리하며, MySQL fallback과 Redis 재구성은 P2에서 도입한다.
 
 ### 다중 서버와 확장성
 
@@ -94,8 +94,8 @@ Outbox와 consumer 중복 방지는 P1의 책임으로 남긴다.
 | P1 | Transactional Outbox, Kafka 재시도와 consumer 중복 방지 |
 | P2 | 성능 측정, Redis fallback·재구성과 운영 관측 |
 
-현재 이슈의 M0 범위는 기준 문서, Flyway migration, Docker Compose와 애플리케이션 연결 설정이다.
-메뉴·포인트·주문·인기 메뉴 API는 `M1 → M4` 순서로 구현한다.
+현재 구현 범위는 M3이다. 메뉴 목록 조회(M1), 포인트 충전(M2), 단일 메뉴 주문·결제와 커밋 후 Kafka
+이벤트 발행(M3)까지 구현되어 있으며, 인기 메뉴 consumer와 조회 API는 M4에서 구현한다.
 
 ## 검증
 

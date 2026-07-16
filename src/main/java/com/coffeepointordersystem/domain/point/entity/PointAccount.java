@@ -1,6 +1,7 @@
 package com.coffeepointordersystem.domain.point.entity;
 
 import com.coffeepointordersystem.domain.point.exception.PointBalanceLimitExceededException;
+import com.coffeepointordersystem.domain.point.exception.InsufficientPointBalanceException;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
@@ -31,6 +32,14 @@ public class PointAccount {
 		} catch (ArithmeticException exception) {
 			throw new PointBalanceLimitExceededException();
 		}
+	}
+
+	public void use(long amount) {
+		if (balance < amount) {
+			throw new InsufficientPointBalanceException();
+		}
+
+		balance -= amount;
 	}
 
 	public String getUserId() {
