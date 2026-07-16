@@ -65,6 +65,12 @@ class OrderConcurrencyTest {
 
 	@AfterEach
 	void cleanUpTestData() {
+		jdbcTemplate.update(
+				"DELETE outbox_events FROM outbox_events "
+						+ "INNER JOIN orders ON outbox_events.order_id = orders.id "
+						+ "WHERE orders.user_id = ?",
+				USER_ID
+		);
 		jdbcTemplate.update("DELETE FROM orders WHERE user_id = ?", USER_ID);
 		jdbcTemplate.update("DELETE FROM point_accounts WHERE user_id = ?", USER_ID);
 	}
@@ -83,6 +89,7 @@ class OrderConcurrencyTest {
 		assertThat(successCount).isEqualTo(1);
 		assertThat(findBalance()).isZero();
 		assertThat(findOrderCount()).isEqualTo(1L);
+		assertThat(findOutboxCount()).isEqualTo(1L);
 	}
 
 	@Test
@@ -92,6 +99,7 @@ class OrderConcurrencyTest {
 		assertThat(countSuccessfulRequests(futures)).isEqualTo(CONCURRENT_REQUEST_COUNT);
 		assertThat(findBalance()).isEqualTo(4_000L);
 		assertThat(findOrderCount()).isEqualTo(CONCURRENT_REQUEST_COUNT / 2L);
+		assertThat(findOutboxCount()).isEqualTo(CONCURRENT_REQUEST_COUNT / 2L);
 	}
 
 	private List<Future<?>> runConcurrently(Runnable command) throws Exception {
@@ -190,6 +198,16 @@ class OrderConcurrencyTest {
 	private long findOrderCount() {
 		return jdbcTemplate.queryForObject(
 				"SELECT COUNT(*) FROM orders WHERE user_id = ?",
+				Long.class,
+				USER_ID
+		);
+	}
+
+	private long findOutboxCount() {
+		return jdbcTemplate.queryForObject(
+				"SELECT COUNT(*) FROM outbox_events "
+						+ "INNER JOIN orders ON outbox_events.order_id = orders.id "
+						+ "WHERE orders.user_id = ?",
 				Long.class,
 				USER_ID
 		);

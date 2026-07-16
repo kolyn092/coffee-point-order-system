@@ -59,6 +59,12 @@ class OrderKafkaFailureIntegrationTest {
 
 	@AfterEach
 	void cleanUpTestData() {
+		jdbcTemplate.update(
+				"DELETE outbox_events FROM outbox_events "
+						+ "INNER JOIN orders ON outbox_events.order_id = orders.id "
+						+ "WHERE orders.user_id = ?",
+				TEST_USER_ID
+		);
 		jdbcTemplate.update("DELETE FROM orders WHERE user_id = ?", TEST_USER_ID);
 		jdbcTemplate.update("DELETE FROM point_accounts WHERE user_id = ?", TEST_USER_ID);
 	}
@@ -86,6 +92,27 @@ class OrderKafkaFailureIntegrationTest {
 				Long.class,
 				TEST_USER_ID
 		)).isEqualTo(1L);
+		assertThat(jdbcTemplate.queryForObject(
+				"SELECT COUNT(*) FROM outbox_events "
+						+ "INNER JOIN orders ON outbox_events.order_id = orders.id "
+						+ "WHERE orders.user_id = ?",
+				Long.class,
+				TEST_USER_ID
+		)).isEqualTo(1L);
+		assertThat(jdbcTemplate.queryForObject(
+				"SELECT outbox_events.status FROM outbox_events "
+						+ "INNER JOIN orders ON outbox_events.order_id = orders.id "
+						+ "WHERE orders.user_id = ?",
+				String.class,
+				TEST_USER_ID
+		)).isEqualTo("PENDING");
+		assertThat(jdbcTemplate.queryForObject(
+				"SELECT outbox_events.published_at FROM outbox_events "
+						+ "INNER JOIN orders ON outbox_events.order_id = orders.id "
+						+ "WHERE orders.user_id = ?",
+				java.sql.Timestamp.class,
+				TEST_USER_ID
+		)).isNull();
 	}
 
 }

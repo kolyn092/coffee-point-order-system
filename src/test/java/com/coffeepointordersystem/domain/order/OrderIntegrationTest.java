@@ -7,6 +7,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import com.coffeepointordersystem.domain.outbox.event.OrderCompletedOutboxEvent;
 import com.coffeepointordersystem.domain.order.event.OrderCompletedEvent;
 import com.coffeepointordersystem.domain.order.service.CreateOrderApplicationService;
 import java.time.Duration;
@@ -45,6 +46,8 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.kafka.KafkaContainer;
 import org.testcontainers.utility.DockerImageName;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.json.JsonMapper;
 
 @Testcontainers
 @SpringBootTest
@@ -76,6 +79,9 @@ class OrderIntegrationTest {
 	private JdbcTemplate jdbcTemplate;
 
 	@Autowired
+	private JsonMapper jsonMapper;
+
+	@Autowired
 	private MockMvc mockMvc;
 
 	@DynamicPropertySource
@@ -99,6 +105,14 @@ class OrderIntegrationTest {
 	@AfterEach
 	void cleanUpTestData() {
 		rollbackFailure.set(false);
+		jdbcTemplate.update(
+				"DELETE outbox_events FROM outbox_events "
+						+ "INNER JOIN orders ON outbox_events.order_id = orders.id "
+						+ "WHERE orders.user_id IN (?, ?, ?)",
+				SUCCESS_USER_ID,
+				INSUFFICIENT_BALANCE_USER_ID,
+				ROLLBACK_USER_ID
+		);
 		jdbcTemplate.update(
 				"DELETE FROM orders WHERE user_id IN (?, ?, ?)",
 				SUCCESS_USER_ID,
@@ -198,6 +212,7 @@ class OrderIntegrationTest {
 
 		assertThat(findBalance(ROLLBACK_USER_ID)).isEqualTo(10_000L);
 		assertThat(findOrderCount(ROLLBACK_USER_ID)).isZero();
+		assertThat(findOutboxCount(ROLLBACK_USER_ID)).isZero();
 	}
 
 	@Test
@@ -231,6 +246,30 @@ class OrderIntegrationTest {
 					java.sql.Timestamp.class,
 					SUCCESS_USER_ID
 			).toInstant());
+			assertThat(findOutboxCount(SUCCESS_USER_ID)).isEqualTo(1L);
+			awaitOutboxPublished(consumer, SUCCESS_USER_ID);
+			assertThat(findOutboxStatus(SUCCESS_USER_ID)).isEqualTo("PUBLISHED");
+			assertThat(jdbcTemplate.queryForObject(
+					"SELECT outbox_events.published_at FROM outbox_events "
+							+ "INNER JOIN orders ON outbox_events.order_id = orders.id "
+							+ "WHERE orders.user_id = ?",
+					java.sql.Timestamp.class,
+					SUCCESS_USER_ID
+			)).isNotNull();
+			String payload = jdbcTemplate.queryForObject(
+					"SELECT outbox_events.payload FROM outbox_events "
+							+ "INNER JOIN orders ON outbox_events.order_id = orders.id "
+							+ "WHERE orders.user_id = ?",
+					String.class,
+					SUCCESS_USER_ID
+			);
+			JsonNode payloadJson = jsonMapper.readTree(payload);
+
+			assertThat(payloadJson.path("orderId").asLong()).isEqualTo(orderId);
+			assertThat(payloadJson.path("userId").asString()).isEqualTo(SUCCESS_USER_ID);
+			assertThat(payloadJson.path("menuId").asLong()).isEqualTo(TEST_MENU_ID);
+			assertThat(payloadJson.path("paidAmount").asLong()).isEqualTo(MENU_PRICE);
+			assertThat(payloadJson.path("occurredAt").asString()).isEqualTo(event.occurredAt().toString());
 		}
 	}
 
@@ -268,6 +307,38 @@ class OrderIntegrationTest {
 		return jdbcTemplate.queryForObject(
 				"SELECT COUNT(*) FROM orders WHERE user_id = ?",
 				Long.class,
+				userId
+		);
+	}
+
+	private long findOutboxCount(String userId) {
+		return jdbcTemplate.queryForObject(
+				"SELECT COUNT(*) FROM outbox_events "
+						+ "INNER JOIN orders ON outbox_events.order_id = orders.id "
+						+ "WHERE orders.user_id = ?",
+				Long.class,
+				userId
+		);
+	}
+
+	private void awaitOutboxPublished(Consumer<String, OrderCompletedEvent> consumer, String userId) {
+		for (int attempt = 0; attempt < 10; attempt++) {
+			if (findOutboxStatus(userId).equals("PUBLISHED")) {
+				return;
+			}
+
+			consumer.poll(Duration.ofSeconds(1));
+		}
+
+		assertThat(findOutboxStatus(userId)).isEqualTo("PUBLISHED");
+	}
+
+	private String findOutboxStatus(String userId) {
+		return jdbcTemplate.queryForObject(
+				"SELECT outbox_events.status FROM outbox_events "
+						+ "INNER JOIN orders ON outbox_events.order_id = orders.id "
+						+ "WHERE orders.user_id = ?",
+				String.class,
 				userId
 		);
 	}
@@ -331,7 +402,7 @@ class OrderIntegrationTest {
 	static class RollbackTestListener {
 
 		@TransactionalEventListener(phase = TransactionPhase.BEFORE_COMMIT)
-		public void failCommit(OrderCompletedEvent event) {
+		public void failCommit(OrderCompletedOutboxEvent event) {
 			if (rollbackFailure.get()) {
 				throw new IllegalStateException("rollback test failure");
 			}
