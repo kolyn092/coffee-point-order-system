@@ -26,6 +26,7 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 class PointIntegrationTest {
 
 	private static final String TEST_USER_ID = "point-integration-user";
+	private static final String JSON_COERCION_TEST_USER_ID = "123";
 	private static final String SUPPLEMENTARY_CHARACTER_USER_ID = "\uD83D\uDE00".repeat(64);
 
 	@Container
@@ -54,11 +55,17 @@ class PointIntegrationTest {
 				TEST_USER_ID,
 				0L
 		);
+		jdbcTemplate.update(
+				"INSERT INTO point_accounts (user_id, balance) VALUES (?, ?)",
+				JSON_COERCION_TEST_USER_ID,
+				0L
+		);
 	}
 
 	@AfterEach
 	void cleanUpPointAccounts() {
 		jdbcTemplate.update("DELETE FROM point_accounts WHERE user_id = ?", TEST_USER_ID);
+		jdbcTemplate.update("DELETE FROM point_accounts WHERE user_id = ?", JSON_COERCION_TEST_USER_ID);
 		jdbcTemplate.update("DELETE FROM point_accounts WHERE user_id = ?", SUPPLEMENTARY_CHARACTER_USER_ID);
 	}
 
@@ -126,6 +133,38 @@ class PointIntegrationTest {
 							"""))
 				.andExpect(status().isBadRequest())
 				.andExpect(jsonPath("$.code").value("INVALID_REQUEST"));
+	}
+
+	@Test
+	void chargePoint_rejectsNumericUserIdAndPreservesBalance() throws Exception {
+		mockMvc.perform(post("/api/v1/points/charges")
+					.contentType(MediaType.APPLICATION_JSON)
+					.content("""
+							{
+							  "userId": 123,
+							  "amount": 10000
+							}
+							"""))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.code").value("INVALID_REQUEST"));
+
+		assertThatPointAccount(JSON_COERCION_TEST_USER_ID, 0L);
+	}
+
+	@Test
+	void chargePoint_rejectsStringAmountAndPreservesBalance() throws Exception {
+		mockMvc.perform(post("/api/v1/points/charges")
+					.contentType(MediaType.APPLICATION_JSON)
+					.content("""
+							{
+							  "userId": "123",
+							  "amount": "10000"
+							}
+							"""))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.code").value("INVALID_REQUEST"));
+
+		assertThatPointAccount(JSON_COERCION_TEST_USER_ID, 0L);
 	}
 
 	@Test
