@@ -153,7 +153,8 @@ class InfrastructureIntegrationTest {
 				"PRIMARY",
 				"uk_outbox_events_order_id",
 				"fk_outbox_events_order",
-				"chk_outbox_events_status"
+				"chk_outbox_events_status",
+				"chk_outbox_events_status_published_at"
 		);
 		assertThat(indexNames).contains(
 				"PRIMARY",
@@ -161,6 +162,12 @@ class InfrastructureIntegrationTest {
 				"idx_outbox_events_status_id"
 		);
 		assertThatThrownBy(() -> insertOutbox(orderId, "INVALID"))
+				.isInstanceOf(UncategorizedSQLException.class)
+				.hasMessageContaining("Check constraint");
+		assertThatThrownBy(() -> insertOutbox(orderId, "PUBLISHED"))
+				.isInstanceOf(UncategorizedSQLException.class)
+				.hasMessageContaining("Check constraint");
+		assertThatThrownBy(() -> insertOutbox(orderId, "PENDING", Timestamp.from(TEST_ORDERED_AT)))
 				.isInstanceOf(UncategorizedSQLException.class)
 				.hasMessageContaining("Check constraint");
 
@@ -347,15 +354,20 @@ class InfrastructureIntegrationTest {
 	}
 
 	private void insertOutbox(long orderId, String status) {
+		insertOutbox(orderId, status, null);
+	}
+
+	private void insertOutbox(long orderId, String status, Timestamp publishedAt) {
 		jdbcTemplate.update(
 				"""
-						INSERT INTO outbox_events (order_id, payload, status, created_at)
-						VALUES (?, ?, ?, ?)
+						INSERT INTO outbox_events (order_id, payload, status, created_at, published_at)
+						VALUES (?, ?, ?, ?, ?)
 						""",
 				orderId,
 				"{\"orderId\":%d}".formatted(orderId),
 				status,
-				Timestamp.from(TEST_ORDERED_AT)
+				Timestamp.from(TEST_ORDERED_AT),
+				publishedAt
 		);
 	}
 

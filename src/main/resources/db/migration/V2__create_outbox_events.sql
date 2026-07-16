@@ -11,6 +11,10 @@ CREATE TABLE outbox_events (
         FOREIGN KEY (order_id) REFERENCES orders (id)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT chk_outbox_events_status CHECK (status IN ('PENDING', 'PUBLISHED')),
+    CONSTRAINT chk_outbox_events_status_published_at CHECK (
+        (status = 'PENDING' AND published_at IS NULL)
+        OR (status = 'PUBLISHED' AND published_at IS NOT NULL)
+    ),
     INDEX idx_outbox_events_status_id (status, id)
 ) ENGINE = InnoDB
   DEFAULT CHARACTER SET = utf8mb4
