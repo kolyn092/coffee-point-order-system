@@ -141,6 +141,8 @@ class PopularMenuIntegrationTest {
 				.andExpect(jsonPath("$[1].menuId").value(2L))
 				.andExpect(jsonPath("$[1].orderCount").value(8L))
 				.andExpect(jsonPath("$[2].menuId").value(3L))
+				.andExpect(jsonPath("$[2].name").value("카푸치노"))
+				.andExpect(jsonPath("$[2].price").value(5500L))
 				.andExpect(jsonPath("$[2].orderCount").value(7L))
 				.andExpect(jsonPath("$").isArray())
 				.andExpect(jsonPath("$").value(org.hamcrest.Matchers.hasSize(3)));
