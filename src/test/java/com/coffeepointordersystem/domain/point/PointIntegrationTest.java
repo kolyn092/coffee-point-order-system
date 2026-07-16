@@ -26,6 +26,7 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 class PointIntegrationTest {
 
 	private static final String TEST_USER_ID = "point-integration-user";
+	private static final String SUPPLEMENTARY_CHARACTER_USER_ID = "\uD83D\uDE00".repeat(64);
 
 	@Container
 	static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.0.36")
@@ -58,6 +59,7 @@ class PointIntegrationTest {
 	@AfterEach
 	void cleanUpPointAccounts() {
 		jdbcTemplate.update("DELETE FROM point_accounts WHERE user_id = ?", TEST_USER_ID);
+		jdbcTemplate.update("DELETE FROM point_accounts WHERE user_id = ?", SUPPLEMENTARY_CHARACTER_USER_ID);
 	}
 
 	@Test
@@ -122,6 +124,46 @@ class PointIntegrationTest {
 							  "amount": 0
 							}
 							"""))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.code").value("INVALID_REQUEST"));
+	}
+
+	@Test
+	void chargePoint_acceptsUserIdWith64SupplementaryCharacters() throws Exception {
+		jdbcTemplate.update(
+				"INSERT INTO point_accounts (user_id, balance) VALUES (?, ?)",
+				SUPPLEMENTARY_CHARACTER_USER_ID,
+				0L
+		);
+
+		mockMvc.perform(post("/api/v1/points/charges")
+					.contentType(MediaType.APPLICATION_JSON)
+					.content("""
+							{
+							  "userId": "%s",
+							  "amount": 10000
+							}
+							""".formatted(SUPPLEMENTARY_CHARACTER_USER_ID)))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.userId").value(SUPPLEMENTARY_CHARACTER_USER_ID))
+				.andExpect(jsonPath("$.chargedAmount").value(10000))
+				.andExpect(jsonPath("$.balance").value(10000));
+
+		assertThatPointAccount(SUPPLEMENTARY_CHARACTER_USER_ID, 10000L);
+	}
+
+	@Test
+	void chargePoint_returnsInvalidRequestForUserIdWith65SupplementaryCharacters() throws Exception {
+		String userId = "\uD83D\uDE00".repeat(65);
+
+		mockMvc.perform(post("/api/v1/points/charges")
+					.contentType(MediaType.APPLICATION_JSON)
+					.content("""
+							{
+							  "userId": "%s",
+							  "amount": 10000
+							}
+							""".formatted(userId)))
 				.andExpect(status().isBadRequest())
 				.andExpect(jsonPath("$.code").value("INVALID_REQUEST"));
 	}

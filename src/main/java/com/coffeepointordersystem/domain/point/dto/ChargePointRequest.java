@@ -3,11 +3,9 @@ package com.coffeepointordersystem.domain.point.dto;
 import jakarta.validation.constraints.AssertTrue;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
-import jakarta.validation.constraints.Size;
 
 public record ChargePointRequest(
 		@NotNull
-		@Size(min = 1, max = 64)
 		String userId,
 		@NotNull
 		@Positive
@@ -16,7 +14,7 @@ public record ChargePointRequest(
 
 	@AssertTrue
 	public boolean isUserIdValid() {
-		if (userId == null || userId.isBlank()) {
+		if (userId == null || userId.isBlank() || userId.codePointCount(0, userId.length()) > 64) {
 			return false;
 		}
 
