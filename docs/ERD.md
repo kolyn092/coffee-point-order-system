@@ -2,9 +2,9 @@
 
 ## 1. 문서 범위
 
-이 문서는 `docs/PRD.md`의 `원 과제 최소·제출 요구사항` 절과 P0 데이터 모델, 관계, 타입, 제약과 인덱스를
-정의한다. MySQL을 메뉴, 포인트와 주문의 단일 원본으로 사용하며 Redis는 재구성 가능한 인기 메뉴 조회 모델로만
-사용한다.
+이 문서는 `docs/PRD.md`의 `원 과제 최소·제출 요구사항` 절, P0 데이터 모델과 P1 M5 Transactional Outbox의
+관계, 타입, 제약과 인덱스를 정의한다. MySQL을 메뉴, 포인트와 주문의 단일 원본으로 사용하며 Redis는 재구성 가능한
+인기 메뉴 조회 모델로만 사용한다.
 
 ### 요구사항 추적
 
@@ -15,6 +15,7 @@
 | ORDER-01 주문·결제 | `menus`, `point_accounts`, `orders` | 주문 완료 이벤트 |
 | EVENT-01 주문 데이터 전송 | `orders` | Kafka `order.completed` |
 | POPULAR-01 인기 메뉴 조회 | `orders`, `menus` | Redis 일자별 Sorted Set |
+| P1 M5 Transactional Outbox 저장 | `orders`, `outbox_events` | `order.completed` 발행 대기·완료 상태 |
 
 ## 2. 설계 원칙
 
@@ -27,6 +28,8 @@
 - 주문에는 메뉴의 현재 가격과 별개로 결제 당시 가격을 저장한다.
 - 숫자 surrogate PK는 `BIGINT AUTO_INCREMENT`를 사용하고 금액과 포인트는 signed `BIGINT`를 사용한다.
 - 모든 영속 시각은 UTC로 생성하고 읽는다.
+- P1 M5에서는 주문 완료 이벤트의 발행 시점 데이터를 JSON 스냅샷으로 저장한다. 발행 대기와 완료 상태만 저장하며,
+  재시도 횟수와 실패 원인은 M6의 범위다.
 
 ## 3. 관계도
 
@@ -34,6 +37,7 @@
 erDiagram
     MENUS ||--o{ ORDERS : "주문된다"
     POINT_ACCOUNTS ||--o{ ORDERS : "결제한다"
+    ORDERS ||--|| OUTBOX_EVENTS : "발행 대기 이벤트를 남긴다"
 
     MENUS {
         BIGINT id PK
@@ -52,6 +56,15 @@ erDiagram
         BIGINT menu_id FK
         BIGINT paid_amount
         DATETIME ordered_at
+    }
+
+    OUTBOX_EVENTS {
+        BIGINT id PK
+        BIGINT order_id FK
+        JSON payload
+        VARCHAR status
+        DATETIME created_at
+        DATETIME published_at
     }
 ```
 
@@ -138,6 +151,37 @@ P0 애플리케이션은 회원가입 API를 구현하지 않는다.
 `idx_orders_ordered_at_menu_id`는 P2 fallback에서 직접 사용하지만 MySQL이 최종 원본이라는 P0 모델에도
 포함한다. 별도 인기 집계 테이블은 만들지 않는다.
 
+### 4.4 `outbox_events`
+
+P1 M5에서 주문 완료 이벤트를 주문 트랜잭션과 원자적으로 저장하는 Outbox다. 이 단계에서는
+`order.completed`만 저장하므로 범용 이벤트 유형, 재시도 횟수와 실패 원인을 추가하지 않는다.
+
+| 컬럼 | 타입 | NULL | 키·기본값 | 설명 |
+| --- | --- | --- | --- | --- |
+| `id` | `BIGINT` | N | PK, AUTO_INCREMENT | Outbox 이벤트 식별값 |
+| `order_id` | `BIGINT` | N | FK, UNIQUE | 이벤트를 만든 주문 ID |
+| `payload` | `JSON` | N |  | Kafka `order.completed` 계약 전체의 생성 시점 스냅샷 |
+| `status` | `VARCHAR(20)` | N |  | `PENDING` 또는 `PUBLISHED` |
+| `created_at` | `DATETIME(6)` | N |  | 주문과 함께 생성한 UTC 시각 |
+| `published_at` | `DATETIME(6)` | Y |  | Kafka 1회 발행 성공 후 `PUBLISHED`로 전이한 UTC 시각 |
+
+#### 제약
+
+| 이름 | 정의 | 목적 |
+| --- | --- | --- |
+| `pk_outbox_events` | `PRIMARY KEY (id)` | Outbox 이벤트 식별 |
+| `uk_outbox_events_order_id` | `UNIQUE (order_id)` | 주문 하나당 주문 완료 이벤트 하나 보장 |
+| `fk_outbox_events_order` | `FOREIGN KEY (order_id) REFERENCES orders(id)` | 존재하는 주문의 이벤트만 저장 |
+| `chk_outbox_events_status` | `CHECK (status IN ('PENDING', 'PUBLISHED'))` | M5 상태 전이 범위 강제 |
+
+FK는 `ON UPDATE RESTRICT ON DELETE RESTRICT`를 사용한다.
+
+#### 인덱스
+
+| 이름 | 컬럼 | 목적 |
+| --- | --- | --- |
+| `idx_outbox_events_status_id` | `(status, id)` | M6에서 `PENDING` 이벤트를 식별하는 조회 지원 |
+
 ## 5. 트랜잭션과 동시성 불변식
 
 ### 5.1 사전 생성된 포인트 계정의 충전
@@ -171,6 +215,21 @@ JVM 로컬 락, `synchronized`, Redis와 Kafka는 포인트·주문 정합성에
 애플리케이션은 `Instant` 등 UTC 기준 값을 사용하고 로컬 기본 timezone에 의존하지 않는다.
 
 인기 집계의 기간 경계는 조회 UTC 날짜가 `D`일 때 `[D-6 00:00:00Z, D+1 00:00:00Z)`다.
+
+### 5.4 P1 M5 Transactional Outbox
+
+P1 M5의 주문 트랜잭션은 P0 주문·결제 불변식에 다음을 추가한다.
+
+1. `orders` insert와 같은 트랜잭션에서 `order_id`와 Kafka `order.completed` payload 스냅샷을 가진
+   `outbox_events` 행을 `PENDING`으로 저장한다.
+2. 포인트 차감, 주문 저장과 Outbox 저장 중 하나라도 실패하면 전체를 rollback한다.
+3. commit 후 기존 Kafka 발행을 한 번 시도한다. 성공하면 별도 트랜잭션에서 Outbox 행을 `PUBLISHED`로 전이하고
+   `published_at`을 기록한다.
+4. Kafka 발행 또는 상태 전이가 실패하면 Outbox 행은 `PENDING`으로 남긴다. M5는 자동 재시도를 실행하지 않고,
+   M6이 이 행을 재시도한다.
+
+Kafka 발행 성공 뒤 상태 전이가 실패하면 같은 이벤트의 재발행이 가능하다. M7에서 consumer 중복 처리를 도입하기
+전까지 이 가능성을 제거하려고 JVM 로컬 상태나 분산 락을 추가하지 않는다.
 
 ## 6. Redis 인기 메뉴 조회 모델
 

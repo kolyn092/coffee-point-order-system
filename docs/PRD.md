@@ -113,6 +113,17 @@ API 요청·응답과 오류는 `docs/API.md`, 데이터 모델과 DB 제약은 
 - P0는 커밋 후 한 번 발행하므로 장애 시 이벤트가 유실될 수 있다.
 - P1에서는 Transactional Outbox와 재시도로 유실 가능성을 줄인다.
 
+#### P1 M5 Transactional Outbox 전환 정책
+
+- 주문·포인트 차감 트랜잭션 안에서 `outbox_events`에 `order.completed` 이벤트 스냅샷을 `PENDING` 상태로 함께
+  저장한다. 주문, 포인트 차감 또는 Outbox 저장 중 하나라도 실패하면 모두 rollback한다.
+- M5에서도 기존의 커밋 후 Kafka 1회 발행은 유지한다. 발행에 성공하면 별도 트랜잭션에서 해당 Outbox 행을
+  `PUBLISHED`로 전이하고 발행 시각을 기록한다.
+- Kafka 발행 또는 `PUBLISHED` 전이가 실패하면 행은 `PENDING`으로 남긴다. M5에는 자동 재시도를 넣지 않으며,
+  M6에서 `PENDING` 행의 재시도를 구현한다.
+- Kafka 발행 성공 뒤 상태 전이가 실패하면 M6 재시도로 같은 이벤트가 다시 발행될 수 있다. 이 중복 전달의
+  부수 효과 방지는 M7 consumer 중복 처리의 책임이다.
+
 ### 다중 서버
 
 - 애플리케이션은 로컬 상태를 보관하지 않는 stateless 구조로 동작한다.
@@ -163,7 +174,7 @@ P0가 완료되기 전에는 P1과 P2를 시작하지 않는다.
 
 | M | 작업 | 완료 신호 |
 | --- | --- | --- |
-| M5 | Transactional Outbox 저장 | 주문과 Outbox가 함께 commit·rollback됨 |
+| M5 | Transactional Outbox 저장 | 주문과 `PENDING` Outbox가 함께 commit·rollback되고, 기존 1회 발행 성공 시 `PUBLISHED`로 전이됨 |
 | M6 | Kafka 게시 재시도 | Kafka 장애 복구 후 이벤트가 최종 발행됨 |
 | M7 | Consumer 중복 처리 | 같은 이벤트를 여러 번 받아도 점수가 한 번만 증가함 |
 
@@ -184,7 +195,7 @@ P0가 완료되기 전에는 P1과 P2를 시작하지 않는다.
 | 실행 환경 | Docker Compose | 세 인프라를 같은 방식으로 실행한다. | 기동 시간과 자원 사용이 증가한다. |
 | 동시성 | DB 비관적 잠금 | 정확성을 설명하고 검증하기 쉽다. | 경합 증가 시 원자 UPDATE를 검토한다. |
 | 인기 메뉴 | 일자별 Redis Sorted Set | 합산과 Top 3 조회가 빠르다. | 장애 시 MySQL로 복구한다. |
-| 외부 전송 | 커밋 후 Kafka 발행 | 주문과 후속 처리를 분리한다. | P1에서 Outbox를 도입한다. |
+| 외부 전송 | 커밋 후 Kafka 발행 | 주문과 후속 처리를 분리한다. | P1 M5에서 Outbox 저장·상태 전이를 추가하고 M6에서 재시도를 도입한다. |
 
 참고 문서의 Kafka·Redis 흐름은 적용하되 회원가입과 `develop` 브랜치는 적용하지 않는다.
 원 사양의 범위와 저장소의 `main → feature/#N-슬러그` 규칙을 따른다.
