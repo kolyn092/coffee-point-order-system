@@ -99,7 +99,8 @@ Outbox와 consumer 중복 방지는 P1의 책임으로 남긴다.
 | P2 | 성능 측정, Redis fallback·재구성과 운영 관측 |
 
 메뉴 목록 조회(M1), 포인트 충전(M2), 단일 메뉴 주문·결제와 커밋 후 Kafka 이벤트 발행(M3), 인기 메뉴
-consumer와 조회 API(M4)가 구현되어 있다. 다음 작업은 주문과 Outbox를 함께 저장하는 P1 M5다.
+consumer와 조회 API(M4), 주문·포인트 차감과 Outbox를 함께 저장하는 Transactional Outbox(M5)가 구현되어 있다.
+다음 작업은 `PENDING` Outbox 이벤트를 재시도하는 M6이다.
 
 ## 검증
 

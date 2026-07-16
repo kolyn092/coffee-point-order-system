@@ -72,6 +72,12 @@ class InfrastructureIntegrationTest {
 
 	@AfterEach
 	void cleanUpTestData() {
+		jdbcTemplate.update(
+				"DELETE outbox_events FROM outbox_events "
+						+ "INNER JOIN orders ON outbox_events.order_id = orders.id "
+						+ "WHERE orders.user_id = ?",
+				TEST_USER_ID
+		);
 		jdbcTemplate.update("DELETE FROM orders WHERE user_id = ?", TEST_USER_ID);
 		jdbcTemplate.update("DELETE FROM point_accounts WHERE user_id = ?", TEST_USER_ID);
 		jdbcTemplate.update("DELETE FROM menus WHERE id = ?", TEST_MENU_ID);
@@ -108,12 +114,12 @@ class InfrastructureIntegrationTest {
 						SELECT COUNT(*)
 						FROM information_schema.tables
 						WHERE table_schema = DATABASE()
-						  AND table_name IN ('menus', 'point_accounts', 'orders')
+						  AND table_name IN ('menus', 'point_accounts', 'orders', 'outbox_events')
 						""",
 				Long.class
 		);
 
-		assertThat(tableCount).isEqualTo(3L);
+		assertThat(tableCount).isEqualTo(4L);
 		assertThat(jdbcTemplate.queryForList(
 				"SELECT name FROM menus ORDER BY id",
 				String.class
@@ -122,6 +128,57 @@ class InfrastructureIntegrationTest {
 				"SELECT price FROM menus ORDER BY id",
 				Long.class
 		)).containsExactly(4500L, 5000L);
+	}
+
+	@Test
+	void flywayMigration_createsRequiredOutboxConstraintsAndIndex() {
+		insertValidOrder();
+		Long orderId = jdbcTemplate.queryForObject(
+				"SELECT id FROM orders WHERE user_id = ?",
+				Long.class,
+				TEST_USER_ID
+		);
+		List<String> constraintNames = jdbcTemplate.queryForList(
+				"SELECT constraint_name FROM information_schema.table_constraints "
+						+ "WHERE table_schema = DATABASE() AND table_name = 'outbox_events'",
+				String.class
+		);
+		List<String> indexNames = jdbcTemplate.queryForList(
+				"SELECT DISTINCT index_name FROM information_schema.statistics "
+						+ "WHERE table_schema = DATABASE() AND table_name = 'outbox_events'",
+				String.class
+		);
+
+		assertThat(constraintNames).contains(
+				"PRIMARY",
+				"uk_outbox_events_order_id",
+				"fk_outbox_events_order",
+				"chk_outbox_events_status",
+				"chk_outbox_events_status_published_at"
+		);
+		assertThat(indexNames).contains(
+				"PRIMARY",
+				"uk_outbox_events_order_id",
+				"idx_outbox_events_status_id"
+		);
+		assertThatThrownBy(() -> insertOutbox(orderId, "INVALID"))
+				.isInstanceOf(UncategorizedSQLException.class)
+				.hasMessageContaining("Check constraint");
+		assertThatThrownBy(() -> insertOutbox(orderId, "PUBLISHED"))
+				.isInstanceOf(UncategorizedSQLException.class)
+				.hasMessageContaining("Check constraint");
+		assertThatThrownBy(() -> insertOutbox(orderId, "PENDING", Timestamp.from(TEST_ORDERED_AT)))
+				.isInstanceOf(UncategorizedSQLException.class)
+				.hasMessageContaining("Check constraint");
+
+		insertOutbox(orderId, "PENDING");
+
+		assertThatThrownBy(() -> insertOutbox(orderId, "PENDING"))
+				.isInstanceOf(DataIntegrityViolationException.class);
+		assertThatThrownBy(() -> jdbcTemplate.update(
+				"DELETE FROM orders WHERE id = ?",
+				orderId
+		)).isInstanceOf(DataIntegrityViolationException.class);
 	}
 
 	@Test
@@ -293,6 +350,24 @@ class InfrastructureIntegrationTest {
 				menuId,
 				paidAmount,
 				Timestamp.from(TEST_ORDERED_AT)
+		);
+	}
+
+	private void insertOutbox(long orderId, String status) {
+		insertOutbox(orderId, status, null);
+	}
+
+	private void insertOutbox(long orderId, String status, Timestamp publishedAt) {
+		jdbcTemplate.update(
+				"""
+						INSERT INTO outbox_events (order_id, payload, status, created_at, published_at)
+						VALUES (?, ?, ?, ?, ?)
+						""",
+				orderId,
+				"{\"orderId\":%d}".formatted(orderId),
+				status,
+				Timestamp.from(TEST_ORDERED_AT),
+				publishedAt
 		);
 	}
 
