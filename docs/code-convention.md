@@ -222,7 +222,8 @@ boolean reusable = idempotency.requestHash().equals(requestHash)
 
 - 공통 에러 코드는 `global.error.ErrorCode` 한 곳에서 관리하고 `docs/API.md`의 코드와 일치시킨다.
 - 도메인 예외는 에러 코드와 원인을 보존하며, `GlobalExceptionHandler`가 HTTP 응답으로 변환한다.
-- 공통 오류 응답은 API 계약의 `code`, `message` 구조를 유지한다. 성공 응답에 임의의 공통 wrapper를 추가하지 않는다.
+- 공통 API 응답은 `global.response.ApiResponse`으로 관리한다. 성공 응답은 `code: "SUCCESS"`와 `data`를, 오류
+  응답은 `code`, `message`를 반환하며 값이 없는 필드는 직렬화하지 않는다.
 - 상속만을 위한 `BaseController`, `BaseService`, `BaseRepository`는 만들지 않는다.
 - 두 곳에서 우연히 같은 코드가 보인다는 이유만으로 공통화하지 않는다. 책임과 변경 이유가 같을 때만 공유한다.
 
