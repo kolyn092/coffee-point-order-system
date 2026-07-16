@@ -3,7 +3,9 @@ package com.coffeepointordersystem.domain.menu.controller;
 import com.coffeepointordersystem.domain.menu.dto.MenuListResponse;
 import com.coffeepointordersystem.domain.menu.dto.PopularMenuResponse;
 import com.coffeepointordersystem.domain.menu.service.MenuService;
+import com.coffeepointordersystem.global.response.ApiResponse;
 import java.util.List;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -19,13 +21,13 @@ public class MenuController {
 	}
 
 	@GetMapping
-	public List<MenuListResponse> findMenus() {
-		return menuService.findMenus();
+	public ResponseEntity<ApiResponse<List<MenuListResponse>>> findMenus() {
+		return ResponseEntity.ok(ApiResponse.ok(menuService.findMenus()));
 	}
 
 	@GetMapping("/popular")
-	public List<PopularMenuResponse> findPopularMenus() {
-		return menuService.findPopularMenus();
+	public ResponseEntity<ApiResponse<List<PopularMenuResponse>>> findPopularMenus() {
+		return ResponseEntity.ok(ApiResponse.ok(menuService.findPopularMenus()));
 	}
 
 }

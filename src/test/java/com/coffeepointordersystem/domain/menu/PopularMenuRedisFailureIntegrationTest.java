@@ -45,7 +45,9 @@ class PopularMenuRedisFailureIntegrationTest {
 	void getPopularMenus_returnsServiceUnavailableWhenRedisIsUnavailable() throws Exception {
 		mockMvc.perform(get("/api/v1/menus/popular"))
 				.andExpect(status().isServiceUnavailable())
-				.andExpect(jsonPath("$.code").value("POPULAR_MENU_UNAVAILABLE"));
+				.andExpect(jsonPath("$.code").value("POPULAR_MENU_UNAVAILABLE"))
+				.andExpect(jsonPath("$.message").value("인기 메뉴를 조회할 수 없습니다."))
+				.andExpect(jsonPath("$.data").doesNotExist());
 	}
 
 }

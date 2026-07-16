@@ -135,12 +135,13 @@ class OrderIntegrationTest {
 		mockMvc.perform(createOrderRequest(SUCCESS_USER_ID, TEST_MENU_ID))
 				.andExpect(status().isCreated())
 				.andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
-				.andExpect(jsonPath("$.orderId").isNumber())
-				.andExpect(jsonPath("$.userId").value(SUCCESS_USER_ID))
-				.andExpect(jsonPath("$.menuId").value(TEST_MENU_ID))
-				.andExpect(jsonPath("$.paidAmount").value(MENU_PRICE))
-				.andExpect(jsonPath("$.remainingPointBalance").value(5_500L))
-				.andExpect(jsonPath("$.orderedAt").isNotEmpty());
+				.andExpect(jsonPath("$.code").value("SUCCESS"))
+				.andExpect(jsonPath("$.data.orderId").isNumber())
+				.andExpect(jsonPath("$.data.userId").value(SUCCESS_USER_ID))
+				.andExpect(jsonPath("$.data.menuId").value(TEST_MENU_ID))
+				.andExpect(jsonPath("$.data.paidAmount").value(MENU_PRICE))
+				.andExpect(jsonPath("$.data.remainingPointBalance").value(5_500L))
+				.andExpect(jsonPath("$.data.orderedAt").isNotEmpty());
 
 		assertThat(findBalance(SUCCESS_USER_ID)).isEqualTo(5_500L);
 		assertThat(findOrderCount(SUCCESS_USER_ID)).isEqualTo(1L);
@@ -174,7 +175,9 @@ class OrderIntegrationTest {
 
 		mockMvc.perform(createOrderRequest(SUCCESS_USER_ID, 999L))
 				.andExpect(status().isNotFound())
-				.andExpect(jsonPath("$.code").value("MENU_NOT_FOUND"));
+				.andExpect(jsonPath("$.code").value("MENU_NOT_FOUND"))
+				.andExpect(jsonPath("$.message").value("메뉴를 찾을 수 없습니다."))
+				.andExpect(jsonPath("$.data").doesNotExist());
 
 		assertThat(findBalance(SUCCESS_USER_ID)).isEqualTo(10_000L);
 		assertThat(findOrderCount(SUCCESS_USER_ID)).isZero();

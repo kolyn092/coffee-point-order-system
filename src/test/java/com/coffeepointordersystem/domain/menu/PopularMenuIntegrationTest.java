@@ -2,7 +2,6 @@ package com.coffeepointordersystem.domain.menu;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
-import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -136,23 +135,26 @@ class PopularMenuIntegrationTest {
 
 		mockMvc.perform(get("/api/v1/menus/popular"))
 				.andExpect(status().isOk())
-				.andExpect(jsonPath("$[0].menuId").value(1L))
-				.andExpect(jsonPath("$[0].orderCount").value(8L))
-				.andExpect(jsonPath("$[1].menuId").value(2L))
-				.andExpect(jsonPath("$[1].orderCount").value(8L))
-				.andExpect(jsonPath("$[2].menuId").value(3L))
-				.andExpect(jsonPath("$[2].name").value("카푸치노"))
-				.andExpect(jsonPath("$[2].price").value(5500L))
-				.andExpect(jsonPath("$[2].orderCount").value(7L))
-				.andExpect(jsonPath("$").isArray())
-				.andExpect(jsonPath("$").value(org.hamcrest.Matchers.hasSize(3)));
+				.andExpect(jsonPath("$.code").value("SUCCESS"))
+				.andExpect(jsonPath("$.data[0].menuId").value(1L))
+				.andExpect(jsonPath("$.data[0].orderCount").value(8L))
+				.andExpect(jsonPath("$.data[1].menuId").value(2L))
+				.andExpect(jsonPath("$.data[1].orderCount").value(8L))
+				.andExpect(jsonPath("$.data[2].menuId").value(3L))
+				.andExpect(jsonPath("$.data[2].name").value("카푸치노"))
+				.andExpect(jsonPath("$.data[2].price").value(5500L))
+				.andExpect(jsonPath("$.data[2].orderCount").value(7L))
+				.andExpect(jsonPath("$.data").isArray())
+				.andExpect(jsonPath("$.data").value(org.hamcrest.Matchers.hasSize(3)));
 	}
 
 	@Test
 	void getPopularMenus_returnsEmptyArrayWhenNoAggregateExists() throws Exception {
 		mockMvc.perform(get("/api/v1/menus/popular"))
 				.andExpect(status().isOk())
-				.andExpect(content().json("[]"));
+				.andExpect(jsonPath("$.code").value("SUCCESS"))
+				.andExpect(jsonPath("$.data").isArray())
+				.andExpect(jsonPath("$.data").isEmpty());
 	}
 
 	private void addOrderCount(LocalDate date, long menuId, long orderCount) {
