@@ -1,6 +1,7 @@
 package com.coffeepointordersystem.global.error;
 
 import com.coffeepointordersystem.domain.menu.exception.MenuNotFoundException;
+import com.coffeepointordersystem.domain.menu.exception.PopularMenuUnavailableException;
 import com.coffeepointordersystem.domain.point.exception.InsufficientPointBalanceException;
 import com.coffeepointordersystem.domain.point.exception.PointBalanceLimitExceededException;
 import com.coffeepointordersystem.domain.point.exception.PointAccountNotFoundException;
@@ -35,6 +36,11 @@ public class GlobalExceptionHandler {
 	@ExceptionHandler(MenuNotFoundException.class)
 	public ResponseEntity<ErrorResponse> handleMenuNotFound(MenuNotFoundException exception) {
 		return toResponseEntity(ErrorCode.MENU_NOT_FOUND);
+	}
+
+	@ExceptionHandler(PopularMenuUnavailableException.class)
+	public ResponseEntity<ErrorResponse> handlePopularMenuUnavailable(PopularMenuUnavailableException exception) {
+		return toResponseEntity(ErrorCode.POPULAR_MENU_UNAVAILABLE);
 	}
 
 	@ExceptionHandler(PointAccountNotFoundException.class)

@@ -9,6 +9,7 @@ public enum ErrorCode {
 	POINT_ACCOUNT_NOT_FOUND(HttpStatus.NOT_FOUND, "포인트 계정을 찾을 수 없습니다."),
 	INSUFFICIENT_POINT_BALANCE(HttpStatus.CONFLICT, "포인트 잔액이 부족합니다."),
 	POINT_BALANCE_LIMIT_EXCEEDED(HttpStatus.CONFLICT, "포인트 잔액 한도를 초과했습니다."),
+	POPULAR_MENU_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE, "인기 메뉴를 조회할 수 없습니다."),
 	INTERNAL_SERVER_ERROR(HttpStatus.INTERNAL_SERVER_ERROR, "서버 오류가 발생했습니다.");
 
 	private final HttpStatus httpStatus;
