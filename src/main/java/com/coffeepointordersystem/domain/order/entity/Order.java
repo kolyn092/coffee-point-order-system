@@ -7,6 +7,7 @@ import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 
 @Entity
 @Table(name = "orders")
@@ -39,7 +40,7 @@ public class Order {
 	}
 
 	public static Order create(String userId, long menuId, long paidAmount, Instant orderedAt) {
-		return new Order(userId, menuId, paidAmount, orderedAt);
+		return new Order(userId, menuId, paidAmount, orderedAt.truncatedTo(ChronoUnit.MICROS));
 	}
 
 	public Long getId() {
