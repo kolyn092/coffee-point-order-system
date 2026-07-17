@@ -10,6 +10,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.json.JsonMapper;
@@ -59,7 +60,7 @@ public class OutboxEventRetryService {
 	 * @param outboxEventId 최초 발행할 Outbox 이벤트 식별자
 	 * @throws IllegalStateException payload 복원, Kafka 발행 또는 상태 전이에 실패한 경우
 	 */
-	@Transactional
+	@Transactional(propagation = Propagation.REQUIRES_NEW)
 	public void publishPendingEvent(long outboxEventId) {
 		outboxEventRepository.findByIdForUpdate(outboxEventId)
 				.ifPresent(this::publishIfPending);
