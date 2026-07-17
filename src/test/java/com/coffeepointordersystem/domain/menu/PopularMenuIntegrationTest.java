@@ -1,19 +1,31 @@
 package com.coffeepointordersystem.domain.menu;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.BDDMockito.then;
+import static org.mockito.Mockito.atLeast;
+import static org.mockito.Mockito.doThrow;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import com.coffeepointordersystem.domain.menu.exception.PopularMenuUnavailableException;
+import com.coffeepointordersystem.domain.menu.port.PopularMenuCache;
+import com.coffeepointordersystem.domain.menu.port.PopularMenuRecordingResult;
 import com.coffeepointordersystem.domain.order.event.OrderCompletedEvent;
+import com.coffeepointordersystem.infra.redis.RedisPopularMenuCache;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.AdminClientConfig;
@@ -35,6 +47,7 @@ import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.MySQLContainer;
@@ -78,6 +91,12 @@ class PopularMenuIntegrationTest {
 	@Autowired
 	private StringRedisTemplate stringRedisTemplate;
 
+	@Autowired
+	private PopularMenuCache popularMenuCache;
+
+	@MockitoSpyBean
+	private RedisPopularMenuCache redisPopularMenuCache;
+
 	@DynamicPropertySource
 	static void registerProperties(DynamicPropertyRegistry registry) {
 		registry.add("spring.datasource.url", MYSQL::getJdbcUrl);
@@ -119,9 +138,101 @@ class PopularMenuIntegrationTest {
 
 		assertThat(awaitOrderCount(key, 3L)).isEqualTo(1.0D);
 
-		long remainingSeconds = stringRedisTemplate.getExpire(key, TimeUnit.SECONDS);
+		long remainingSeconds = stringRedisTemplate.getExpire(key);
 		long expectedRemainingSeconds = Duration.between(Instant.now(), expectedExpiration).toSeconds();
 		assertThat(remainingSeconds).isBetween(expectedRemainingSeconds - 5L, expectedRemainingSeconds + 1L);
+	}
+
+	@Test
+	void consumeOrderCompletedEvent_retriesAfterRedisScriptFailureWithoutDuplicateScore() throws Exception {
+		Instant occurredAt = Instant.now().plus(Duration.ofDays(1L));
+		LocalDate occurredDate = occurredAt.atZone(ZoneOffset.UTC).toLocalDate();
+		String scoreKey = "popular:menu:" + occurredDate;
+		OrderCompletedEvent event = new OrderCompletedEvent(2L, "popular-menu-user", 3L, 5500L, occurredAt);
+		doThrow(new PopularMenuUnavailableException())
+				.doCallRealMethod()
+				.when(redisPopularMenuCache)
+				.recordCompletedOrder(event.orderId(), event.menuId(), event.occurredAt());
+
+		kafkaTemplate.send(ORDER_COMPLETED_TOPIC, "event-2", event).get(10L, TimeUnit.SECONDS);
+
+		assertThat(awaitOrderCount(scoreKey, 3L)).isEqualTo(1.0D);
+		then(redisPopularMenuCache)
+				.should(atLeast(2))
+				.recordCompletedOrder(event.orderId(), event.menuId(), event.occurredAt());
+	}
+
+	@Test
+	void recordCompletedOrder_preventsDuplicateScoreIncreaseAndSetsMatchingExpirations() {
+		Instant occurredAt = Instant.now().plus(Duration.ofDays(1L));
+		LocalDate occurredDate = occurredAt.atZone(ZoneOffset.UTC).toLocalDate();
+		String scoreKey = "popular:menu:" + occurredDate;
+		String processedKey = "popular:menu:processed:" + occurredDate + ":101";
+		Instant expectedExpiration = occurredDate.plusDays(8L).atStartOfDay().toInstant(ZoneOffset.UTC);
+
+		PopularMenuRecordingResult firstResult = popularMenuCache.recordCompletedOrder(101L, 3L, occurredAt);
+		PopularMenuRecordingResult secondResult = popularMenuCache.recordCompletedOrder(101L, 3L, occurredAt);
+
+		assertThat(firstResult).isEqualTo(PopularMenuRecordingResult.PROCESSED);
+		assertThat(secondResult).isEqualTo(PopularMenuRecordingResult.DUPLICATE);
+		assertThat(stringRedisTemplate.opsForZSet().score(scoreKey, "3")).isEqualTo(1.0D);
+		assertThat(stringRedisTemplate.getExpire(scoreKey))
+				.isEqualTo(stringRedisTemplate.getExpire(processedKey));
+		assertThat(stringRedisTemplate.getExpire(scoreKey))
+				.isBetween(
+						Duration.between(Instant.now(), expectedExpiration).toSeconds() - 5L,
+						Duration.between(Instant.now(), expectedExpiration).toSeconds() + 1L
+				);
+	}
+
+	@Test
+	void recordCompletedOrder_skipsEventOutsideSevenDayAggregationWindow() {
+		Instant occurredAt = TODAY.minusDays(8L).atStartOfDay().toInstant(ZoneOffset.UTC);
+		LocalDate occurredDate = occurredAt.atZone(ZoneOffset.UTC).toLocalDate();
+		String scoreKey = "popular:menu:" + occurredDate;
+		String processedKey = "popular:menu:processed:" + occurredDate + ":102";
+
+		PopularMenuRecordingResult result = popularMenuCache.recordCompletedOrder(102L, 3L, occurredAt);
+
+		assertThat(result).isEqualTo(PopularMenuRecordingResult.EXPIRED);
+		assertThat(stringRedisTemplate.hasKey(scoreKey)).isFalse();
+		assertThat(stringRedisTemplate.hasKey(processedKey)).isFalse();
+	}
+
+	@Test
+	void recordCompletedOrder_processesConcurrentSameOrderOnce() throws Exception {
+		Instant occurredAt = Instant.now().plus(Duration.ofDays(1L));
+		LocalDate occurredDate = occurredAt.atZone(ZoneOffset.UTC).toLocalDate();
+		String scoreKey = "popular:menu:" + occurredDate;
+		ExecutorService executorService = Executors.newFixedThreadPool(10);
+		CountDownLatch ready = new CountDownLatch(10);
+		CountDownLatch start = new CountDownLatch(1);
+		List<Future<PopularMenuRecordingResult>> results = new ArrayList<>();
+
+		try {
+			for (int index = 0; index < 10; index++) {
+				results.add(executorService.submit(() -> {
+					ready.countDown();
+					start.await(10L, TimeUnit.SECONDS);
+					return popularMenuCache.recordCompletedOrder(103L, 3L, occurredAt);
+				}));
+			}
+
+			assertThat(ready.await(10L, TimeUnit.SECONDS)).isTrue();
+			start.countDown();
+
+			long processedCount = 0L;
+			for (Future<PopularMenuRecordingResult> result : results) {
+				if (result.get(10L, TimeUnit.SECONDS) == PopularMenuRecordingResult.PROCESSED) {
+					processedCount++;
+				}
+			}
+
+			assertThat(processedCount).isEqualTo(1L);
+			assertThat(stringRedisTemplate.opsForZSet().score(scoreKey, "3")).isEqualTo(1.0D);
+		} finally {
+			executorService.shutdownNow();
+		}
 	}
 
 	@Test
