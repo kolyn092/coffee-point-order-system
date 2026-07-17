@@ -46,13 +46,28 @@ public class OutboxEventRetryService {
 	@Transactional
 	public boolean publishNextPendingEvent() {
 		return outboxEventRepository.findFirstPendingForUpdate()
-				.map(this::publish)
+				.map(outboxEvent -> {
+					publishIfPending(outboxEvent);
+					return true;
+				})
 				.orElse(false);
 	}
 
-	private boolean publish(OutboxEvent outboxEvent) {
+	/**
+	 * 주문 commit 후 최초 발행할 Outbox 이벤트를 행 잠금으로 소유하고, 다른 게시자가 잠근 이벤트는 건너뛴다.
+	 *
+	 * @param outboxEventId 최초 발행할 Outbox 이벤트 식별자
+	 * @throws IllegalStateException payload 복원, Kafka 발행 또는 상태 전이에 실패한 경우
+	 */
+	@Transactional
+	public void publishPendingEvent(long outboxEventId) {
+		outboxEventRepository.findByIdForUpdate(outboxEventId)
+				.ifPresent(this::publishIfPending);
+	}
+
+	private void publishIfPending(OutboxEvent outboxEvent) {
 		if (outboxEvent.getStatus() != OutboxEventStatus.PENDING) {
-			return true;
+			return;
 		}
 
 		OrderCompletedEvent orderCompletedEvent = deserialize(outboxEvent.getPayload());
@@ -61,8 +76,6 @@ public class OutboxEventRetryService {
 				Duration.ofMillis(outboxRetryProperties.publishTimeoutMillis())
 		);
 		outboxEvent.markPublished(Instant.now(clock));
-
-		return true;
 	}
 
 	private OrderCompletedEvent deserialize(String payload) {

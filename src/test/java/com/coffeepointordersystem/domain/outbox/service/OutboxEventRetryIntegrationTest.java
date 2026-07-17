@@ -4,7 +4,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.coffeepointordersystem.domain.order.event.OrderCompletedEvent;
+import com.coffeepointordersystem.domain.outbox.event.OrderCompletedOutboxEvent;
 import com.coffeepointordersystem.domain.outbox.port.OrderCompletedEventPublisher;
+import com.coffeepointordersystem.infra.kafka.OrderCompletedKafkaPublisher;
 import java.sql.Timestamp;
 import java.time.Clock;
 import java.time.Duration;
@@ -83,6 +85,11 @@ class OutboxEventRetryIntegrationTest {
 	@Autowired
 	private OutboxEventRetryService outboxEventRetryService;
 
+	@Autowired
+	private OrderCompletedKafkaPublisher orderCompletedKafkaPublisher;
+
+	private long outboxEventId;
+
 	@DynamicPropertySource
 	static void registerProperties(DynamicPropertyRegistry registry) {
 		registry.add("spring.datasource.url", MYSQL::getJdbcUrl);
@@ -98,7 +105,7 @@ class OutboxEventRetryIntegrationTest {
 		createOrderCompletedTopic();
 		orderCompletedEventPublisher.reset();
 		clock.reset();
-		insertPendingOutboxEvent();
+		outboxEventId = insertPendingOutboxEvent();
 	}
 
 	@AfterEach
@@ -185,6 +192,43 @@ class OutboxEventRetryIntegrationTest {
 		assertThat(orderCompletedEventPublisher.getPublishCount()).isEqualTo(1);
 	}
 
+	@Test
+	void publish_preventsSchedulerFromRepublishingDuringInitialKafkaPublication() throws Exception {
+		try (Consumer<String, OrderCompletedEvent> consumer = createConsumer()) {
+			consumer.subscribe(List.of(ORDER_COMPLETED_TOPIC));
+			awaitPartitionAssignment(consumer);
+			orderCompletedEventPublisher.blockNextPublication();
+			ExecutorService executorService = Executors.newFixedThreadPool(2);
+
+			try {
+				Future<Void> initialPublication = executorService.submit(() -> {
+					orderCompletedKafkaPublisher.publish(
+							new OrderCompletedOutboxEvent(outboxEventId, orderCompletedEvent())
+					);
+					return null;
+				});
+
+				assertThat(orderCompletedEventPublisher.awaitPublicationStart()).isTrue();
+				Future<Void> retryPublication = executorService.submit(() -> {
+					outboxEventRetryScheduler.retryPendingEvents();
+					return null;
+				});
+
+				orderCompletedEventPublisher.allowPublication();
+
+				initialPublication.get(10, TimeUnit.SECONDS);
+				retryPublication.get(10, TimeUnit.SECONDS);
+			} finally {
+				executorService.shutdownNow();
+			}
+
+			assertThat(countOrderCompletedEvents(consumer)).isEqualTo(1);
+		}
+
+		assertThat(findOutboxStatus()).isEqualTo("PUBLISHED");
+		assertThat(orderCompletedEventPublisher.getPublishCount()).isEqualTo(1);
+	}
+
 	private void createOrderCompletedTopic() throws Exception {
 		try (AdminClient adminClient = AdminClient.create(Map.of(
 				AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG,
@@ -234,6 +278,20 @@ class OutboxEventRetryIntegrationTest {
 		throw new AssertionError("Kafka에서 재시도한 주문 완료 이벤트를 받지 못했습니다.");
 	}
 
+	private int countOrderCompletedEvents(Consumer<String, OrderCompletedEvent> consumer) {
+		int eventCount = 0;
+
+		for (int attempt = 0; attempt < 10; attempt++) {
+			for (ConsumerRecord<String, OrderCompletedEvent> record : consumer.poll(Duration.ofMillis(200))) {
+				if (record.value().orderId() == 101L) {
+					eventCount++;
+				}
+			}
+		}
+
+		return eventCount;
+	}
+
 	private void awaitPartitionAssignment(Consumer<String, OrderCompletedEvent> consumer) {
 		for (int attempt = 0; attempt < 10; attempt++) {
 			consumer.poll(Duration.ofSeconds(1));
@@ -245,7 +303,7 @@ class OutboxEventRetryIntegrationTest {
 		assertThat(consumer.assignment()).isNotEmpty();
 	}
 
-	private void insertPendingOutboxEvent() {
+	private long insertPendingOutboxEvent() {
 		jdbcTemplate.update(
 				"INSERT INTO point_accounts (user_id, balance) VALUES (?, ?)",
 				TEST_USER_ID,
@@ -274,6 +332,14 @@ class OutboxEventRetryIntegrationTest {
 						"paidAmount":4500,"occurredAt":"2026-07-17T01:00:00.123456Z"}
 						""",
 				Timestamp.from(ORDERED_AT)
+		);
+
+		return jdbcTemplate.queryForObject(
+				"SELECT outbox_events.id FROM outbox_events "
+						+ "INNER JOIN orders ON outbox_events.order_id = orders.id "
+						+ "WHERE orders.user_id = ?",
+				Long.class,
+				TEST_USER_ID
 		);
 	}
 
