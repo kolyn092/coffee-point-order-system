@@ -3,7 +3,6 @@ package com.coffeepointordersystem.infra.redis;
 import com.coffeepointordersystem.domain.menu.exception.PopularMenuUnavailableException;
 import com.coffeepointordersystem.domain.menu.port.PopularMenuCache;
 import com.coffeepointordersystem.domain.menu.port.PopularMenuRecordingResult;
-import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
@@ -57,20 +56,15 @@ public class RedisPopularMenuCache implements PopularMenuCache {
 	);
 
 	private final StringRedisTemplate stringRedisTemplate;
-	private final Clock clock;
 
-	public RedisPopularMenuCache(StringRedisTemplate stringRedisTemplate, Clock clock) {
+	public RedisPopularMenuCache(StringRedisTemplate stringRedisTemplate) {
 		this.stringRedisTemplate = stringRedisTemplate;
-		this.clock = clock;
 	}
 
 	@Override
 	public PopularMenuRecordingResult recordCompletedOrder(long orderId, long menuId, Instant occurredAt) {
 		LocalDate date = occurredAt.atZone(ZoneOffset.UTC).toLocalDate();
 		Instant expirationAt = toExpirationAt(date);
-		if (!clock.instant().isBefore(expirationAt)) {
-			return PopularMenuRecordingResult.EXPIRED;
-		}
 
 		try {
 			Long result = stringRedisTemplate.execute(
