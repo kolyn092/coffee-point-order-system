@@ -80,7 +80,8 @@ class OrderKafkaFailureIntegrationTest {
 							}
 							"""))
 				.andExpect(status().isCreated())
-				.andExpect(jsonPath("$.remainingPointBalance").value(5_500L));
+				.andExpect(jsonPath("$.code").value("SUCCESS"))
+				.andExpect(jsonPath("$.data.remainingPointBalance").value(5_500L));
 
 		assertThat(jdbcTemplate.queryForObject(
 				"SELECT balance FROM point_accounts WHERE user_id = ?",

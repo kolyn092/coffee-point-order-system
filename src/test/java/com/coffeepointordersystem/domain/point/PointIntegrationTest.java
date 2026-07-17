@@ -81,9 +81,10 @@ class PointIntegrationTest {
 							"""))
 				.andExpect(status().isOk())
 				.andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
-				.andExpect(jsonPath("$.userId").value(TEST_USER_ID))
-				.andExpect(jsonPath("$.chargedAmount").value(10000))
-				.andExpect(jsonPath("$.balance").value(10000));
+				.andExpect(jsonPath("$.code").value("SUCCESS"))
+				.andExpect(jsonPath("$.data.userId").value(TEST_USER_ID))
+				.andExpect(jsonPath("$.data.chargedAmount").value(10000))
+				.andExpect(jsonPath("$.data.balance").value(10000));
 
 		assertThatPointAccount(TEST_USER_ID, 10000L);
 	}
@@ -101,8 +102,8 @@ class PointIntegrationTest {
 							}
 							"""))
 				.andExpect(status().isOk())
-				.andExpect(jsonPath("$.chargedAmount").value(5000))
-				.andExpect(jsonPath("$.balance").value(15000));
+				.andExpect(jsonPath("$.data.chargedAmount").value(5000))
+				.andExpect(jsonPath("$.data.balance").value(15000));
 
 		assertThatPointAccount(TEST_USER_ID, 15000L);
 	}
@@ -118,7 +119,9 @@ class PointIntegrationTest {
 							}
 							"""))
 				.andExpect(status().isBadRequest())
-				.andExpect(jsonPath("$.code").value("INVALID_REQUEST"));
+				.andExpect(jsonPath("$.code").value("INVALID_REQUEST"))
+				.andExpect(jsonPath("$.message").value("요청 값이 올바르지 않습니다."))
+				.andExpect(jsonPath("$.data").doesNotExist());
 	}
 
 	@Test
@@ -184,9 +187,9 @@ class PointIntegrationTest {
 							}
 							""".formatted(SUPPLEMENTARY_CHARACTER_USER_ID)))
 				.andExpect(status().isOk())
-				.andExpect(jsonPath("$.userId").value(SUPPLEMENTARY_CHARACTER_USER_ID))
-				.andExpect(jsonPath("$.chargedAmount").value(10000))
-				.andExpect(jsonPath("$.balance").value(10000));
+				.andExpect(jsonPath("$.data.userId").value(SUPPLEMENTARY_CHARACTER_USER_ID))
+				.andExpect(jsonPath("$.data.chargedAmount").value(10000))
+				.andExpect(jsonPath("$.data.balance").value(10000));
 
 		assertThatPointAccount(SUPPLEMENTARY_CHARACTER_USER_ID, 10000L);
 	}

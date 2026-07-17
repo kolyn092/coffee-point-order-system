@@ -59,9 +59,10 @@ class MenuIntegrationTest {
 		mockMvc.perform(get("/api/v1/menus"))
 				.andExpect(status().isOk())
 				.andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
-				.andExpect(jsonPath("$[0].menuId").value(FIRST_MENU_ID))
-				.andExpect(jsonPath("$[0].name").value("아메리카노"))
-				.andExpect(jsonPath("$[0].price").value(4500));
+				.andExpect(jsonPath("$.code").value("SUCCESS"))
+				.andExpect(jsonPath("$.data[0].menuId").value(FIRST_MENU_ID))
+				.andExpect(jsonPath("$.data[0].name").value("아메리카노"))
+				.andExpect(jsonPath("$.data[0].price").value(4500));
 	}
 
 	@Test
@@ -72,16 +73,18 @@ class MenuIntegrationTest {
 
 		mockMvc.perform(get("/api/v1/menus"))
 				.andExpect(status().isOk())
-				.andExpect(jsonPath("$[0].menuId").value(FIRST_MENU_ID))
-				.andExpect(jsonPath("$[1].menuId").value(SECOND_MENU_ID))
-				.andExpect(jsonPath("$[2].menuId").value(THIRD_MENU_ID));
+				.andExpect(jsonPath("$.data[0].menuId").value(FIRST_MENU_ID))
+				.andExpect(jsonPath("$.data[1].menuId").value(SECOND_MENU_ID))
+				.andExpect(jsonPath("$.data[2].menuId").value(THIRD_MENU_ID));
 	}
 
 	@Test
 	void getMenus_returnsEmptyArrayWhenNoMenusExist() throws Exception {
 		mockMvc.perform(get("/api/v1/menus"))
 				.andExpect(status().isOk())
-				.andExpect(content().json("[]"));
+				.andExpect(jsonPath("$.code").value("SUCCESS"))
+				.andExpect(jsonPath("$.data").isArray())
+				.andExpect(jsonPath("$.data").isEmpty());
 	}
 
 	private void insertMenu(long menuId, String name, long price) {

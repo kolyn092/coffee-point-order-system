@@ -33,7 +33,9 @@ class PointControllerTest {
 							}
 							"""))
 				.andExpect(status().isBadRequest())
-				.andExpect(jsonPath("$.code").value("INVALID_REQUEST"));
+				.andExpect(jsonPath("$.code").value("INVALID_REQUEST"))
+				.andExpect(jsonPath("$.message").value("요청 값이 올바르지 않습니다."))
+				.andExpect(jsonPath("$.data").doesNotExist());
 
 		verifyNoInteractions(pointService);
 	}
