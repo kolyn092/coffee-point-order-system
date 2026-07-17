@@ -82,14 +82,18 @@ Sorted Set으로 인기 메뉴를 조회하는 파생 모델이다. M3에서는 
 P1 M5에서는 주문 트랜잭션과 같은 범위에서 Kafka 이벤트 스냅샷을 `PENDING` Outbox 행으로 저장한다. 기존의
 커밋 후 1회 발행은 유지하고 성공 시 행을 `PUBLISHED`로 전이한다. M6에서는 각 인스턴스의 주기 게시자가 DB 행
 잠금으로 `PENDING` 행을 한 건씩 소유해 Kafka에 재발행하고, 성공 시 `PUBLISHED`로 전이한다. Kafka 발행 성공 뒤
-상태 전이 실패로 발생할 수 있는 중복 소비 방지는 M7에서 처리한다.
+상태 전이 실패로 같은 이벤트가 다시 전달될 수 있다. M7은 이 중복을 `orderId`로 판단하고, Redis 원자 스크립트에서
+처리 표식 기록과 인기 메뉴 점수 증가를 함께 실행해 점수가 한 번만 증가하도록 한다. 처리 표식과 일자별 점수 key는
+모두 해당 이벤트 UTC 날짜의 `D+8 00:00:00Z`에 만료한다. Redis 데이터 유실의 감지·복구와 MySQL fallback은
+M8의 책임이다.
 
 ### 다중 서버와 확장성
 
 애플리케이션은 JVM 로컬 락이나 로컬 캐시 없이 stateless로 동작한다. 모든 인스턴스가 같은 MySQL의
 트랜잭션·제약·행 잠금을 사용하므로 포인트와 주문 정합성을 공유한다. Redis와 Kafka는 MySQL 원본을
-대체하지 않는 비동기·조회 확장 지점으로 분리한다. 이벤트 유실과 중복 소비를 줄이는 Transactional
-Outbox와 consumer 중복 방지는 P1의 책임으로 남긴다.
+대체하지 않는 비동기·조회 확장 지점으로 분리한다. Transactional Outbox는 이벤트 유실 가능성을 줄이고,
+M7의 Redis 원자 처리 정책은 Kafka 재전달의 중복 부수 효과를 막는다. Redis 자체 유실은 M8에서 MySQL 원본으로
+복구한다.
 
 ## 개발 단계와 현재 범위
 
@@ -100,8 +104,9 @@ Outbox와 consumer 중복 방지는 P1의 책임으로 남긴다.
 | P2 | 성능 측정, Redis fallback·재구성과 운영 관측 |
 
 메뉴 목록 조회(M1), 포인트 충전(M2), 단일 메뉴 주문·결제와 커밋 후 Kafka 이벤트 발행(M3), 인기 메뉴
-consumer와 조회 API(M4), 주문·포인트 차감과 Outbox를 함께 저장하는 Transactional Outbox(M5)가 구현되어 있다.
-다음 작업은 확정된 M6 정책에 따라 `PENDING` Outbox 이벤트를 재시도하는 것이다.
+consumer와 조회 API(M4), 주문·포인트 차감과 Outbox를 함께 저장하는 Transactional Outbox(M5), `PENDING`
+Outbox를 재발행하는 M6가 구현되어 있다. M7은 동일 `orderId`의 중복 소비를 Redis 원자 스크립트로 방지하는 정책을
+확정했으며, 다음 구현 작업에서 이 정책을 consumer에 적용한다.
 
 ## 검증
 

@@ -148,6 +148,25 @@ API 요청·응답과 오류는 `docs/API.md`, 데이터 모델과 DB 제약은 
   Kafka 발행 성공 뒤 DB 전이가 실패해 발생할 수 있는 중복 전달과 consumer 부수 효과 방지는 M7의 책임으로 남긴다.
 - M6에는 재시도 횟수, 실패 원인, 새 상태값 또는 dead-letter 처리를 추가하지 않는다.
 
+#### P1 M7 Kafka consumer 중복 처리 정책
+
+- 같은 `order.completed` 이벤트의 중복 판단 기준은 기존 이벤트의 `orderId` 하나다. 주문 하나에는 Outbox 이벤트가
+  하나만 생성되므로, `orderId`가 같으면 Kafka 재전달·M6 재시도와 무관하게 같은 인기 메뉴 반영으로 취급한다.
+- consumer는 Redis 원자 스크립트 안에서 처리 표식의 `SET ... NX PXAT`과 일자별 Sorted Set의
+  `ZINCRBY 1 <menuId>`를 함께 실행한다. 스크립트가 표식을 처음 만들었을 때만 점수를 증가시키며, 이미 표식이
+  있으면 점수를 바꾸지 않는다.
+- 처리 표식 key는 `popular:menu:processed:<yyyy-MM-dd>:<orderId>`이고, 날짜는 이벤트 `occurredAt`의 UTC
+  날짜다. 표식과 `popular:menu:<yyyy-MM-dd>` 점수 key는 모두 해당 날짜 `D`의 `D+8 00:00:00Z`에 만료한다.
+- 여러 인스턴스의 consumer가 같은 이벤트를 동시에 받아도 Redis 스크립트가 단일 원자성 경계가 되므로 한 요청만
+  `ZINCRBY`를 실행한다. JVM 로컬 상태, `synchronized`, 로컬 캐시와 MySQL 소비 기록으로 중복을 판단하지 않는다.
+- Redis 스크립트가 성공한 뒤 Kafka offset commit 전에 프로세스가 중단되면, 재전달된 이벤트는 남아 있는 표식 때문에
+  점수를 다시 증가시키지 않는다. Redis 연결·스크립트 실행이 실패하면 offset을 확정하지 않아 재전달 대상으로 남긴다.
+- 이벤트 날짜의 `D+8 00:00:00Z`가 지난 뒤 도착한 이벤트는 최근 7개 UTC 날짜 집계 대상 밖이므로 점수와 표식을
+  만들지 않고 소비를 완료한다. 표식 만료 뒤 같은 이벤트가 재전달되어도 이미 집계 대상 밖이므로 현재 조회 결과에
+  영향을 주지 않는다.
+- Redis 데이터 유실, 개별 key eviction과 Redis 장애는 M7에서 감지·복구하지 않는다. 유실된 표식과 점수의 불일치,
+  유실 후 재전달되지 않는 주문의 누락, Redis 복구와 MySQL fallback은 P2 M8의 책임이다.
+
 ### 다중 서버
 
 - 애플리케이션은 로컬 상태를 보관하지 않는 stateless 구조로 동작한다.
@@ -165,9 +184,11 @@ API 요청·응답과 오류는 `docs/API.md`, 데이터 모델과 DB 제약은 
 ### Redis
 
 - Redis는 인기 메뉴 조회 모델이며 MySQL 주문 데이터가 최종 원본이다.
-- Kafka consumer는 일자별 Sorted Set에 `ZINCRBY 1 <menuId>`를 실행한다.
-- key는 `popular:menu:<yyyy-MM-dd>`, member는 메뉴 ID, score는 주문 수다.
-- 각 key는 해당 UTC 날짜로부터 8일 후 만료한다.
+- Kafka consumer는 Redis 원자 스크립트 안에서 처리 표식 기록과 일자별 Sorted Set의 `ZINCRBY 1 <menuId>`를
+  함께 실행한다.
+- 점수 key는 `popular:menu:<yyyy-MM-dd>`, member는 메뉴 ID, score는 주문 수다. 처리 표식 key는
+  `popular:menu:processed:<yyyy-MM-dd>:<orderId>`다.
+- 점수 key와 처리 표식은 모두 해당 UTC 날짜 `D`의 `D+8 00:00:00Z`에 만료한다.
 - 조회 시 최근 7개 key의 score를 합산해 주문 수 내림차순으로 최대 3개를 반환한다.
 - Redis 반영은 Kafka 소비 이후 완료되므로 인기 메뉴는 최종 일관성을 허용한다.
 - P0에서는 Redis 연결·조회 장애 시 인기 메뉴 조회를 실패 처리한다.
@@ -200,7 +221,7 @@ P0가 완료되기 전에는 P1과 P2를 시작하지 않는다.
 | --- | --- | --- |
 | M5 | Transactional Outbox 저장 | 주문과 `PENDING` Outbox가 함께 commit·rollback되고, 기존 1회 발행 성공 시 `PUBLISHED`로 전이됨 |
 | M6 | Kafka 게시 재시도 | Kafka 장애 복구 후 `PENDING` 이벤트가 최종 발행되고 `PUBLISHED`로 전이됨 |
-| M7 | Consumer 중복 처리 | 같은 이벤트를 여러 번 받아도 점수가 한 번만 증가함 |
+| M7 | Consumer 중복 처리 | 같은 `orderId` 이벤트를 여러 번 받아도 Redis 점수가 한 번만 증가함 |
 
 ### P2 마일스톤
 
@@ -218,7 +239,7 @@ P0가 완료되기 전에는 P1과 P2를 시작하지 않는다.
 | --- | --- | --- | --- |
 | 실행 환경 | Docker Compose | 세 인프라를 같은 방식으로 실행한다. | 기동 시간과 자원 사용이 증가한다. |
 | 동시성 | DB 비관적 잠금 | 정확성을 설명하고 검증하기 쉽다. | 경합 증가 시 원자 UPDATE를 검토한다. |
-| 인기 메뉴 | 일자별 Redis Sorted Set | 합산과 Top 3 조회가 빠르다. | 장애 시 MySQL로 복구한다. |
+| 인기 메뉴 | Redis 원자 스크립트와 일자별 Sorted Set | 중복 표식과 점수 증가를 한 번에 처리한다. | Redis 유실 복구는 M8에서 처리한다. |
 | 외부 전송 | 커밋 후 Kafka 발행 | 주문과 후속 처리를 분리한다. | P1 M5에서 Outbox 저장·상태 전이를 추가하고 M6에서 재시도를 도입한다. |
 
 참고 문서의 Kafka·Redis 흐름은 적용하되 회원가입과 `develop` 브랜치는 적용하지 않는다.
@@ -244,4 +265,4 @@ P0가 완료되기 전에는 P1과 P2를 시작하지 않는다.
 - 여러 메뉴·수량과 가격 이력
 - 포인트 원장과 감사 추적
 - Outbox 기반 이벤트 재전송
-- Kafka consumer 중복 방지와 Redis 자동 복구
+- Redis 데이터 유실의 자동 복구와 MySQL fallback
