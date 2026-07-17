@@ -16,6 +16,7 @@
 | EVENT-01 주문 데이터 전송 | `orders` | Kafka `order.completed` |
 | POPULAR-01 인기 메뉴 조회 | `orders`, `menus` | Redis 일자별 Sorted Set |
 | P1 M5 Transactional Outbox 저장 | `orders`, `outbox_events` | `order.completed` 발행 대기·완료 상태 |
+| P1 M7 consumer 중복 처리 | `orders` | Redis 중복 기록과 일자별 인기 메뉴 집계 |
 
 ## 2. 설계 원칙
 
@@ -260,14 +261,22 @@ Redis 데이터는 MySQL `orders`에서 재구성할 수 있는 파생 데이터
 | 날짜 기준 | Kafka 이벤트 `occurredAt`의 UTC 날짜 |
 | member | 10진 문자열로 표현한 `menu_id` |
 | score | 해당 UTC 날짜의 결제 완료 주문 수 |
-| 갱신 | Kafka consumer가 `ZINCRBY 1 <menuId>` 실행 |
-| 만료 | 해당 날짜 `D`의 `D+8 00:00:00Z`에 만료 |
-| 조회 범위 | 조회일 포함 최근 7개 UTC 날짜의 key |
+| 갱신 | Kafka consumer가 중복 기록이 없을 때만 Lua script에서 `ZINCRBY 1 <menuId>` 실행 |
+| 중복 기록 key | `popular:menu:processed:<orderId>` |
+| 중복 기록 값 | 존재 여부만 사용하며 내용은 저장하지 않음 |
+| 중복 기록 생성 조건 | 같은 script에서 집계 key를 증가시키기 직전 `SET NX`로 생성 |
+| 원자성 | 중복 기록 생성, `ZINCRBY`, 두 key의 만료 설정을 하나의 Redis Lua script로 실행 |
+| 만료 | 집계 및 중복 기록 key 모두 해당 날짜 `D`의 `D+8 00:00:00Z`에 만료 |
+| 조회 범위 | 조회일 포함 최근 7개 UTC 날짜의 집계 key |
 | 정렬 | 합산 score 내림차순, 동점이면 `menu_id` 오름차순, 최대 3개 |
 
-P0의 Redis 연결·조회 장애는 `POPULAR_MENU_UNAVAILABLE`로 실패 처리한다. 정상 응답에서 누락된 key는 주문이
-없는 것으로 간주하며 P0는 데이터 유실을 자동 탐지하지 않는다. MySQL fallback과 Redis 재구성은 P2 M8에서
-도입한다.
+M7에서는 중복 기록 key와 집계 key를 같은 날짜 경계로 함께 만료시킨다. 중복 기록이 만료되기 전 같은 `orderId`가
+재전달되면 script는 점수를 증가시키지 않고 성공으로 끝낸다. Redis script 또는 연결이 실패하면 consumer는 예외를
+전파해 Kafka offset을 commit하지 않으며, 부분 반영 상태를 남기지 않는다.
+
+Redis 데이터가 유실되면 M8에서 MySQL `orders`를 기준으로 최근 7개 UTC 날짜를 재집계한다. 재구성은 각 주문의
+`order_id` 중복 기록과 해당 `menu_id` 집계 score를 같은 `D+8 00:00:00Z` 만료 시각으로 함께 복원한다. 복원 전
+인기 메뉴 조회는 `POPULAR_MENU_UNAVAILABLE`로 실패 처리한다.
 
 ## 7. P0에 만들지 않는 모델
 
@@ -278,5 +287,5 @@ P0의 Redis 연결·조회 장애는 `POPULAR_MENU_UNAVAILABLE`로 실패 처리
 | `order_items` | 주문 하나가 메뉴 한 잔만 포함 | 여러 메뉴·수량 도입 시 |
 | `payments` | 결제 수단이 포인트 하나이고 취소·환불이 없음 | 복수 결제·취소·환불 도입 시 |
 | `outbox_events` | P0는 commit 후 Kafka 발행을 한 번 시도 | P1 M5 |
-| consumer 중복 기록 | P0는 Kafka 중복 소비 방지를 지원하지 않음 | P1 M7 |
+| consumer 중복 기록 | P0는 Kafka 중복 소비 방지를 지원하지 않음 | P1 M7에서 Redis `popular:menu:processed:<orderId>` key |
 | 인기 집계 테이블 | Redis가 조회 모델이고 MySQL 주문에서 재집계 가능 | 성능 측정 후 필요할 때 |

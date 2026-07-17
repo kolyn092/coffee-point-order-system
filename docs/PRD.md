@@ -148,6 +148,23 @@ API 요청·응답과 오류는 `docs/API.md`, 데이터 모델과 DB 제약은 
   Kafka 발행 성공 뒤 DB 전이가 실패해 발생할 수 있는 중복 전달과 consumer 부수 효과 방지는 M7의 책임으로 남긴다.
 - M6에는 재시도 횟수, 실패 원인, 새 상태값 또는 dead-letter 처리를 추가하지 않는다.
 
+#### P1 M7 Kafka consumer 중복 처리 정책
+
+- Kafka consumer는 at-least-once 전달을 전제로 한다. 동일한 `orderId`의 `order.completed` 이벤트를 여러 번 수신해도
+  Redis 일자별 Sorted Set 점수는 한 번만 증가해야 한다.
+- Redis에서 이벤트 발생 UTC 날짜 `D`를 기준으로 중복 기록 key `popular:menu:processed:<orderId>`와 집계 key
+  `popular:menu:<yyyy-MM-dd>`를 하나의 Lua script로 처리한다. script는 중복 기록이 없을 때만 기록을 만들고
+  `ZINCRBY 1 <menuId>` 및 두 key의 만료 설정을 함께 실행한다.
+- 중복 기록과 집계 갱신은 같은 Redis script의 원자적 처리 단위다. 여러 consumer 인스턴스가 동시에 같은 이벤트를
+  받아도 한 실행만 점수를 증가시키며, 나머지는 중복으로 판단하고 성공으로 처리한다.
+- 중복 기록과 집계 key는 모두 `D+8 00:00:00Z`에 만료한다. 조회일을 포함한 최근 7개 UTC 날짜의 집계와 같은
+  보존 범위를 사용하여, 조회 대상 기간에는 재전달 이벤트를 다시 집계하지 않는다.
+- script 실행 또는 Redis 연결이 실패하면 Kafka offset을 commit하지 않고 예외를 전파한다. 중복 기록만 남기거나
+  점수만 증가한 부분 성공은 허용하지 않으며, Redis가 복구된 뒤 같은 Kafka 레코드를 재처리한다.
+- Redis 데이터가 유실되면 M8에서 MySQL `orders`를 UTC 7일 창으로 재집계하고, 같은 창의 주문 ID에 대한 중복 기록과
+  집계 key를 함께 재구성한다. 재구성 완료 전에는 인기 메뉴 조회를 실패 처리하며, 재구성 중 consumer 처리는 중지하거나
+  동일한 Redis 원자 script 경로로 직렬화한다.
+
 ### 다중 서버
 
 - 애플리케이션은 로컬 상태를 보관하지 않는 stateless 구조로 동작한다.

@@ -76,13 +76,17 @@ MySQL을 메뉴, 포인트 계정과 주문의 단일 원본으로 사용한다.
 
 Kafka는 주문 트랜잭션 commit 후 `order.completed` 이벤트를 한 번 발행하는 인프라이고, Redis는 일자별
 Sorted Set으로 인기 메뉴를 조회하는 파생 모델이다. M3에서는 Mock consumer 통합 테스트로 주문 완료
-이벤트의 필수 필드 수신을 검증하고, M4에서는 인기 메뉴 consumer와 Redis 반영을 구현한다. P0의 Redis
-장애는 실패로 처리하며, MySQL fallback과 Redis 재구성은 P2에서 도입한다.
+이벤트의 필수 필드 수신을 검증하고, M4에서는 인기 메뉴 consumer와 Redis 반영을 구현한다. M6의 Kafka 발행
+성공 뒤 Outbox 상태 전이 실패는 동일 이벤트의 재발행을 만들 수 있으므로, M7은 `orderId`별 중복 기록과 `ZINCRBY`를
+원자적으로 처리한다. Redis script 실패 시 Kafka offset을 commit하지 않아 재처리하며, Redis 유실 후 MySQL 기준
+재구성과 fallback은 P2 M8에서 도입한다.
 
 P1 M5에서는 주문 트랜잭션과 같은 범위에서 Kafka 이벤트 스냅샷을 `PENDING` Outbox 행으로 저장한다. 기존의
 커밋 후 1회 발행은 유지하고 성공 시 행을 `PUBLISHED`로 전이한다. M6에서는 각 인스턴스의 주기 게시자가 DB 행
 잠금으로 `PENDING` 행을 한 건씩 소유해 Kafka에 재발행하고, 성공 시 `PUBLISHED`로 전이한다. Kafka 발행 성공 뒤
-상태 전이 실패로 발생할 수 있는 중복 소비 방지는 M7에서 처리한다.
+상태 전이 실패가 발생하면 Kafka에는 같은 이벤트가 다시 전달될 수 있다. M7 consumer는 `orderId`별 Redis 중복
+기록과 일자별 인기 메뉴 집계를 하나의 Lua script로 원자 처리하여, 여러 인스턴스가 같은 이벤트를 받아도 점수를
+한 번만 증가시킨다. 중복 기록과 집계 key는 모두 이벤트 UTC 날짜의 `D+8 00:00:00Z`에 만료한다.
 
 ### 다중 서버와 확장성
 
