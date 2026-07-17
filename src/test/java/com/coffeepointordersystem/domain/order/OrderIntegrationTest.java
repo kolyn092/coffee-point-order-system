@@ -8,6 +8,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import com.coffeepointordersystem.domain.outbox.event.OrderCompletedOutboxEvent;
+import com.coffeepointordersystem.domain.outbox.service.OutboxEventRetryScheduler;
 import com.coffeepointordersystem.domain.order.event.OrderCompletedEvent;
 import com.coffeepointordersystem.domain.order.service.CreateOrderApplicationService;
 import java.time.Duration;
@@ -83,6 +84,9 @@ class OrderIntegrationTest {
 
 	@Autowired
 	private MockMvc mockMvc;
+
+	@Autowired
+	private OutboxEventRetryScheduler outboxEventRetryScheduler;
 
 	@DynamicPropertySource
 	static void registerProperties(DynamicPropertyRegistry registry) {
@@ -219,7 +223,7 @@ class OrderIntegrationTest {
 	}
 
 	@Test
-	void createOrder_publishesCommittedOrderCompletedEvent() throws Exception {
+	void createOrder_publishesCommittedOrderCompletedEventWithoutRetryDuplication() throws Exception {
 		insertPointAccount(SUCCESS_USER_ID, 10_000L);
 		createOrderCompletedTopic();
 
@@ -232,6 +236,8 @@ class OrderIntegrationTest {
 
 			ConsumerRecords<String, OrderCompletedEvent> records = consumer.poll(Duration.ofSeconds(10));
 			assertThat(records.records(ORDER_COMPLETED_TOPIC)).hasSize(1);
+			outboxEventRetryScheduler.retryPendingEvents();
+			assertThat(consumer.poll(Duration.ofSeconds(2)).records(ORDER_COMPLETED_TOPIC)).isEmpty();
 
 			OrderCompletedEvent event = records.records(ORDER_COMPLETED_TOPIC).iterator().next().value();
 			Long orderId = jdbcTemplate.queryForObject(

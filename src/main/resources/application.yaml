@@ -43,5 +43,12 @@ spring:
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer
+      properties:
+        max.block.ms: ${OUTBOX_RETRY_PUBLISH_TIMEOUT_MILLIS:5000}
   jackson:
     time-zone: UTC
+
+outbox:
+  retry:
+    fixed-delay: ${OUTBOX_RETRY_FIXED_DELAY:1s}
+    publish-timeout-millis: ${OUTBOX_RETRY_PUBLISH_TIMEOUT_MILLIS:5000}
