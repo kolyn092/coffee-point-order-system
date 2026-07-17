@@ -124,6 +124,20 @@ API 요청·응답과 오류는 `docs/API.md`, 데이터 모델과 DB 제약은 
 - Kafka 발행 성공 뒤 상태 전이가 실패하면 M6 재시도로 같은 이벤트가 다시 발행될 수 있다. 이 중복 전달의
   부수 효과 방지는 M7 consumer 중복 처리의 책임이다.
 
+#### P1 M6 Kafka 게시 재시도 정책
+
+- M5의 주문 commit 후 1회 직접 발행은 유지한다. M6은 그 발행 또는 `PUBLISHED` 상태 전이에 실패해 남은
+  `PENDING` Outbox를 별도 게시자가 재시도하는 단계다.
+- 모든 애플리케이션 인스턴스는 주기적으로 `status`, `id` 인덱스를 사용해 `PENDING` 행을 ID 오름차순으로 찾는다.
+  후보 행은 DB 비관적 행 잠금으로 한 건씩 소유한 뒤 상태가 여전히 `PENDING`인지 확인한다.
+- 게시자는 잠금을 유지한 트랜잭션 안에서 저장된 payload를 Kafka `order.completed`로 발행한다. 발행에 성공하면 같은
+  트랜잭션에서 행을 `PUBLISHED`로 전이하고 `published_at`에 UTC 시각을 기록한다.
+- Kafka 발행 또는 상태 전이가 실패하면 해당 트랜잭션을 rollback한다. 행은 `PENDING`과 `published_at = NULL`을
+  유지하며 다음 주기에서 다시 시도한다.
+- 여러 인스턴스 간 게시 경쟁은 DB 행 잠금으로 조정하며 JVM 로컬 상태, `synchronized`와 분산 락에 의존하지 않는다.
+  Kafka 발행 성공 뒤 DB 전이가 실패해 발생할 수 있는 중복 전달과 consumer 부수 효과 방지는 M7의 책임으로 남긴다.
+- M6에는 재시도 횟수, 실패 원인, 새 상태값 또는 dead-letter 처리를 추가하지 않는다.
+
 ### 다중 서버
 
 - 애플리케이션은 로컬 상태를 보관하지 않는 stateless 구조로 동작한다.
@@ -175,7 +189,7 @@ P0가 완료되기 전에는 P1과 P2를 시작하지 않는다.
 | M | 작업 | 완료 신호 |
 | --- | --- | --- |
 | M5 | Transactional Outbox 저장 | 주문과 `PENDING` Outbox가 함께 commit·rollback되고, 기존 1회 발행 성공 시 `PUBLISHED`로 전이됨 |
-| M6 | Kafka 게시 재시도 | Kafka 장애 복구 후 이벤트가 최종 발행됨 |
+| M6 | Kafka 게시 재시도 | Kafka 장애 복구 후 `PENDING` 이벤트가 최종 발행되고 `PUBLISHED`로 전이됨 |
 | M7 | Consumer 중복 처리 | 같은 이벤트를 여러 번 받아도 점수가 한 번만 증가함 |
 
 ### P2 마일스톤
