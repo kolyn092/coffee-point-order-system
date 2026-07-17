@@ -6,7 +6,7 @@ import java.util.Map;
 
 public interface PopularMenuCache {
 
-	void incrementOrderCount(long menuId, Instant occurredAt);
+	PopularMenuRecordingResult recordCompletedOrder(long orderId, long menuId, Instant occurredAt);
 
 	Map<Long, Long> findOrderCounts(LocalDate from, LocalDate to);
 
