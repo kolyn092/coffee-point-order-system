@@ -167,13 +167,39 @@ API 요청·응답과 오류는 `docs/API.md`, 데이터 모델과 DB 제약은 
 - Redis 데이터 유실, 개별 key eviction과 Redis 장애는 M7에서 감지·복구하지 않는다. 유실된 표식과 점수의 불일치,
   유실 후 재전달되지 않는 주문의 누락, Redis 복구와 MySQL fallback은 P2 M8의 책임이다.
 
+#### P2 M8 Redis fallback·재구성 정책
+
+- 인기 메뉴 Redis 조회는 각 UTC 날짜의 상태 key `popular:menu:state:<yyyy-MM-dd>`와 점수 key를 함께
+  검증한다. 상태가 `EMPTY`이면 해당 날짜에 점수 key가 없어야 하며, 상태가 `READY`이면 점수 key가 있어야 한다.
+  상태 key가 없거나 상태와 점수 key의 조합이 맞지 않으면 Redis 데이터 유실 또는 개별 key eviction으로 인한
+  불완전한 조회 모델로 판단한다. 이 규칙으로 주문이 없는 날짜와 유실된 key를 구분한다.
+- Redis timeout, 연결·명령 실행 실패, 조회 범위 중 하나라도 불완전한 상태는 cache를 신뢰하지 않는 trigger다.
+  이 경우 요청은 최근 7개 UTC 날짜의 결제 완료 `orders`를 MySQL에서 집계해 기존 인기 메뉴 응답으로 반환한다.
+  정상 응답 schema, 집계 기간, 정렬 규칙과 최대 3개 제한은 바꾸지 않는다.
+- Redis가 다시 연결될 수 있으면 한 인스턴스만 MySQL 명명 잠금 `popular-menu-rebuild`를 획득해 재구성한다.
+  잠금을 얻지 못한 인스턴스는 기다리거나 별도 재구성을 시작하지 않고 MySQL fallback 응답만 반환한다. 잠금은
+  재구성 종료 시 같은 연결에서 반드시 해제하며, 연결이 끊기면 MySQL이 소유권을 해제한다.
+- 잠금 소유자는 Redis에 유한 TTL의 재구성 표식을 먼저 만든다. 표식이 있는 동안 조회 API는 Redis의 부분 결과를
+  사용하지 않고 MySQL fallback으로 응답한다. consumer의 Redis 원자 스크립트는 이 표식을 확인해 처리하지 않고
+  실패로 반환하여 Kafka offset을 확정하지 않는다. 재구성 시작 직전에 반영된 주문은 MySQL 원본 집계에 포함하고,
+  표식 이후 보류된 이벤트는 표식 해제 뒤 다시 전달해 반영한다.
+- 재구성은 조회일을 포함한 최근 7개 UTC 날짜의 `orders`를 원본으로 점수 key, 상태 key와 같은 기간 주문의 처리
+  표식을 다시 만든다. 주문이 없는 날짜는 `EMPTY` 상태 key만 만든다. 점수, 상태와 처리 표식은 모두 해당 날짜
+  `D`의 `D+8 00:00:00Z`에 만료한다. 재구성 중인 부분 결과는 `READY` 상태로 공개하지 않는다.
+- M8 구현 뒤 consumer의 Redis 원자 스크립트는 재구성 표식이 없을 때만 점수 증가와 처리 표식 기록을 수행하고,
+  점수가 있는 날짜의 상태 key를 `READY`로 함께 갱신한다. 상태 key도 같은 `D+8 00:00:00Z`에 만료한다.
+- MySQL 집계가 실패하면 fallback 응답을 만들 수 없으므로 `503 POPULAR_MENU_UNAVAILABLE`을 반환한다. Redis 쓰기나
+  재구성 중 실패하면 불완전한 상태를 `READY`로 표시하지 않고 정리 가능한 범위의 부분 key만 제거한 뒤 잠금을
+  해제한다. 이후 요청은 MySQL fallback으로 응답하고 다음 Redis 정상화 후 재구성을 다시 시도한다.
+
 ### 다중 서버
 
 - 애플리케이션은 로컬 상태를 보관하지 않는 stateless 구조로 동작한다.
 - 모든 인스턴스는 같은 MySQL의 트랜잭션과 제약을 사용한다.
 - 포인트와 주문 정합성은 Redis·Kafka가 아니라 MySQL 트랜잭션으로 보장한다.
 - P0에서는 Redis 장애 시 인기 메뉴 조회를 실패 처리한다.
-- P2 M8에서 MySQL 집계 fallback과 Redis 재구성을 도입한다.
+- P2 M8에서는 MySQL 집계 fallback과 MySQL 명명 잠금 기반 Redis 재구성을 적용한다. 재구성 중 모든
+  인스턴스는 같은 Redis 표식과 MySQL 잠금 정책을 사용하며 JVM 로컬 락이나 로컬 cache를 사용하지 않는다.
 
 ### 보안
 
@@ -193,7 +219,8 @@ API 요청·응답과 오류는 `docs/API.md`, 데이터 모델과 DB 제약은 
 - Redis 반영은 Kafka 소비 이후 완료되므로 인기 메뉴는 최종 일관성을 허용한다.
 - P0에서는 Redis 연결·조회 장애 시 인기 메뉴 조회를 실패 처리한다.
 - P0는 Redis 데이터 유실의 자동 탐지와 복구를 지원하지 않는다.
-- P2 M8에서는 MySQL 집계로 fallback하고 Redis 데이터를 재구성할 수 있어야 한다.
+- P2 M8에서는 MySQL 집계로 fallback하고 상태 key로 Redis 데이터 유실·개별 key eviction을 구분한다.
+  MySQL 명명 잠금과 Redis 재구성 표식으로 최근 7개 UTC 날짜의 Redis 데이터를 안전하게 재구성한다.
 
 ## 5. 개발 단계
 
@@ -240,6 +267,7 @@ P0가 완료되기 전에는 P1과 P2를 시작하지 않는다.
 | 실행 환경 | Docker Compose | 세 인프라를 같은 방식으로 실행한다. | 기동 시간과 자원 사용이 증가한다. |
 | 동시성 | DB 비관적 잠금 | 정확성을 설명하고 검증하기 쉽다. | 경합 증가 시 원자 UPDATE를 검토한다. |
 | 인기 메뉴 | Redis 원자 스크립트와 일자별 Sorted Set | 중복 표식과 점수 증가를 한 번에 처리한다. | Redis 유실 복구는 M8에서 처리한다. |
+| Redis 복구 | MySQL fallback과 명명 잠금 재구성 | Redis 장애 중에도 원본 기준 결과를 반환한다. | fallback MySQL 부하와 재구성 중 Kafka lag를 M9에서 관측한다. |
 | 외부 전송 | 커밋 후 Kafka 발행 | 주문과 후속 처리를 분리한다. | P1 M5에서 Outbox 저장·상태 전이를 추가하고 M6에서 재시도를 도입한다. |
 
 참고 문서의 Kafka·Redis 흐름은 적용하되 회원가입과 `develop` 브랜치는 적용하지 않는다.
