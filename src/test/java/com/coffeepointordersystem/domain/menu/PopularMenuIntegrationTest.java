@@ -1,6 +1,7 @@
 package com.coffeepointordersystem.domain.menu;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.BDDMockito.then;
 import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.doThrow;
@@ -64,6 +65,7 @@ class PopularMenuIntegrationTest {
 
 	private static final String ORDER_COMPLETED_TOPIC = "order.completed";
 	private static final LocalDate TODAY = LocalDate.parse("2026-07-15");
+	private static final String REBUILD_USER_ID = "popular-menu-rebuild-user";
 	private static final DockerImageName REDIS_IMAGE = DockerImageName.parse("redis:7.2-alpine");
 
 	@Container
@@ -120,6 +122,8 @@ class PopularMenuIntegrationTest {
 			connection.serverCommands().flushDb();
 			return null;
 		});
+		jdbcTemplate.update("DELETE FROM orders WHERE user_id = ?", REBUILD_USER_ID);
+		jdbcTemplate.update("DELETE FROM point_accounts WHERE user_id = ?", REBUILD_USER_ID);
 		jdbcTemplate.update("DELETE FROM menus WHERE id IN (?, ?)", 3L, 4L);
 	}
 
@@ -237,6 +241,7 @@ class PopularMenuIntegrationTest {
 
 	@Test
 	void getPopularMenus_aggregatesSevenDaysAndReturnsTopThreeWithMenuIdTieBreak() throws Exception {
+		initializeCacheWindow();
 		addOrderCount(TODAY.minusDays(7L), 4L, 100L);
 		addOrderCount(TODAY.minusDays(6L), 1L, 5L);
 		addOrderCount(TODAY, 1L, 3L);
@@ -260,6 +265,43 @@ class PopularMenuIntegrationTest {
 	}
 
 	@Test
+	void getPopularMenus_fallsBackToMySqlAndRebuildsIncompleteRedisCache() throws Exception {
+		insertPointAccount(REBUILD_USER_ID, 20_000L);
+		insertOrder(REBUILD_USER_ID, 3L, 5500L, TODAY.atTime(3, 4).toInstant(ZoneOffset.UTC));
+		insertOrder(REBUILD_USER_ID, 4L, 6000L, TODAY.atTime(5, 6).toInstant(ZoneOffset.UTC));
+		insertOrder(REBUILD_USER_ID, 3L, 5500L, TODAY.atTime(7, 8).toInstant(ZoneOffset.UTC));
+
+		mockMvc.perform(get("/api/v1/menus/popular"))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.code").value("SUCCESS"))
+				.andExpect(jsonPath("$.data[0].menuId").value(3L))
+				.andExpect(jsonPath("$.data[0].orderCount").value(2L))
+				.andExpect(jsonPath("$.data[1].menuId").value(4L))
+				.andExpect(jsonPath("$.data[1].orderCount").value(1L));
+
+		assertThat(stringRedisTemplate.opsForZSet().score("popular:menu:" + TODAY, "3")).isEqualTo(2.0D);
+		assertThat(stringRedisTemplate.opsForValue().get("popular:menu:state:" + TODAY)).isEqualTo("READY");
+		assertThat(stringRedisTemplate.hasKey("popular:menu:processed:" + TODAY + ":1")).isTrue();
+		assertThat(stringRedisTemplate.opsForValue().get("popular:menu:state:" + TODAY.minusDays(1L)))
+				.isEqualTo("EMPTY");
+		assertThat(stringRedisTemplate.hasKey("popular:menu:rebuilding")).isFalse();
+	}
+
+	@Test
+	void recordCompletedOrder_defersConsumptionWhileCacheIsRebuilding() {
+		Instant occurredAt = TODAY.atTime(3, 4).toInstant(ZoneOffset.UTC);
+
+		assertThat(popularMenuCache.tryStartRebuild("rebuild-owner")).isTrue();
+		assertThatThrownBy(() -> popularMenuCache.recordCompletedOrder(104L, 3L, occurredAt))
+				.isInstanceOf(PopularMenuUnavailableException.class);
+
+		popularMenuCache.releaseRebuild("rebuild-owner");
+
+		assertThat(popularMenuCache.recordCompletedOrder(104L, 3L, occurredAt))
+				.isEqualTo(PopularMenuRecordingResult.PROCESSED);
+	}
+
+	@Test
 	void getPopularMenus_returnsEmptyArrayWhenNoAggregateExists() throws Exception {
 		mockMvc.perform(get("/api/v1/menus/popular"))
 				.andExpect(status().isOk())
@@ -270,6 +312,13 @@ class PopularMenuIntegrationTest {
 
 	private void addOrderCount(LocalDate date, long menuId, long orderCount) {
 		stringRedisTemplate.opsForZSet().add("popular:menu:" + date, Long.toString(menuId), orderCount);
+		stringRedisTemplate.opsForValue().set("popular:menu:state:" + date, "READY");
+	}
+
+	private void initializeCacheWindow() {
+		for (LocalDate date = TODAY.minusDays(6L); !date.isAfter(TODAY); date = date.plusDays(1L)) {
+			stringRedisTemplate.opsForValue().set("popular:menu:state:" + date, "EMPTY");
+		}
 	}
 
 	private Double awaitOrderCount(String key, long menuId) {
@@ -311,6 +360,24 @@ class PopularMenuIntegrationTest {
 				menuId,
 				name,
 				price
+		);
+	}
+
+	private void insertPointAccount(String userId, long balance) {
+		jdbcTemplate.update(
+				"INSERT INTO point_accounts (user_id, balance) VALUES (?, ?)",
+				userId,
+				balance
+		);
+	}
+
+	private void insertOrder(String userId, long menuId, long paidAmount, Instant orderedAt) {
+		jdbcTemplate.update(
+				"INSERT INTO orders (user_id, menu_id, paid_amount, ordered_at) VALUES (?, ?, ?, ?)",
+				userId,
+				menuId,
+				paidAmount,
+				orderedAt
 		);
 	}
 
