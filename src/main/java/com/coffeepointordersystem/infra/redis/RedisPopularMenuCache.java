@@ -56,6 +56,15 @@ public class RedisPopularMenuCache implements PopularMenuCache {
 						return -1
 					end
 
+					local state = redis.call('GET', KEYS[4])
+					local scoreExists = redis.call('EXISTS', KEYS[3])
+					if (state == 'READY' and scoreExists == 0)
+							or (state == 'EMPTY' and scoreExists == 1)
+							or (not state and scoreExists == 1)
+							or (state and state ~= 'READY' and state ~= 'EMPTY') then
+						return -2
+					end
+
 					local processed = redis.call('SET', KEYS[2], '1', 'NX', 'PXAT', ARGV[1])
 					if not processed then
 						return 0
@@ -74,9 +83,9 @@ public class RedisPopularMenuCache implements PopularMenuCache {
 						return redis.error_reply(expired.err)
 					end
 
-					local state = redis.pcall('SET', KEYS[4], 'READY', 'PXAT', ARGV[1])
-					if type(state) == 'table' and state.err then
-						return redis.error_reply(state.err)
+					local stateUpdated = redis.pcall('SET', KEYS[4], 'READY', 'PXAT', ARGV[1])
+					if type(stateUpdated) == 'table' and stateUpdated.err then
+						return redis.error_reply(stateUpdated.err)
 					end
 
 					return 1
