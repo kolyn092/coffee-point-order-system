@@ -139,6 +139,7 @@ class PopularMenuIntegrationTest {
 		LocalDate occurredDate = occurredAt.atZone(ZoneOffset.UTC).toLocalDate();
 		String key = "popular:menu:" + occurredDate;
 		Instant expectedExpiration = occurredDate.plusDays(8L).atStartOfDay().toInstant(ZoneOffset.UTC);
+		initializeCacheWindow(occurredDate);
 
 		kafkaTemplate.send(
 				ORDER_COMPLETED_TOPIC,
@@ -159,6 +160,7 @@ class PopularMenuIntegrationTest {
 		LocalDate occurredDate = occurredAt.atZone(ZoneOffset.UTC).toLocalDate();
 		String scoreKey = "popular:menu:" + occurredDate;
 		OrderCompletedEvent event = new OrderCompletedEvent(2L, "popular-menu-user", 3L, 5500L, occurredAt);
+		initializeCacheWindow(occurredDate);
 		doThrow(new PopularMenuUnavailableException())
 				.doCallRealMethod()
 				.when(redisPopularMenuCache)
@@ -179,6 +181,7 @@ class PopularMenuIntegrationTest {
 		String scoreKey = "popular:menu:" + occurredDate;
 		String processedKey = "popular:menu:processed:" + occurredDate + ":101";
 		Instant expectedExpiration = occurredDate.plusDays(8L).atStartOfDay().toInstant(ZoneOffset.UTC);
+		initializeCacheWindow(occurredDate);
 
 		PopularMenuRecordingResult firstResult = popularMenuCache.recordCompletedOrder(101L, 3L, occurredAt);
 		PopularMenuRecordingResult secondResult = popularMenuCache.recordCompletedOrder(101L, 3L, occurredAt);
@@ -214,6 +217,7 @@ class PopularMenuIntegrationTest {
 		Instant occurredAt = Instant.now().plus(Duration.ofDays(1L));
 		LocalDate occurredDate = occurredAt.atZone(ZoneOffset.UTC).toLocalDate();
 		String scoreKey = "popular:menu:" + occurredDate;
+		initializeCacheWindow(occurredDate);
 		ExecutorService executorService = Executors.newFixedThreadPool(10);
 		CountDownLatch ready = new CountDownLatch(10);
 		CountDownLatch start = new CountDownLatch(1);
@@ -273,7 +277,7 @@ class PopularMenuIntegrationTest {
 	@Test
 	void getPopularMenus_fallsBackToMySqlAndRebuildsIncompleteRedisCache() throws Exception {
 		insertPointAccount(REBUILD_USER_ID, 20_000L);
-		insertOrder(REBUILD_USER_ID, 3L, 5500L, TODAY.atTime(3, 4).toInstant(ZoneOffset.UTC));
+		long firstOrderId = insertOrder(REBUILD_USER_ID, 3L, 5500L, TODAY.atTime(3, 4).toInstant(ZoneOffset.UTC));
 		insertOrder(REBUILD_USER_ID, 4L, 6000L, TODAY.atTime(5, 6).toInstant(ZoneOffset.UTC));
 		insertOrder(REBUILD_USER_ID, 3L, 5500L, TODAY.atTime(7, 8).toInstant(ZoneOffset.UTC));
 
@@ -287,7 +291,7 @@ class PopularMenuIntegrationTest {
 
 		assertThat(stringRedisTemplate.opsForZSet().score("popular:menu:" + TODAY, "3")).isEqualTo(2.0D);
 		assertThat(stringRedisTemplate.opsForValue().get("popular:menu:state:" + TODAY)).isEqualTo("READY");
-		assertThat(stringRedisTemplate.hasKey("popular:menu:processed:" + TODAY + ":1")).isTrue();
+		assertThat(stringRedisTemplate.hasKey("popular:menu:processed:" + TODAY + ":" + firstOrderId)).isTrue();
 		assertThat(stringRedisTemplate.opsForValue().get("popular:menu:state:" + TODAY.minusDays(1L)))
 				.isEqualTo("EMPTY");
 		assertThat(stringRedisTemplate.hasKey("popular:menu:rebuilding")).isFalse();
@@ -296,6 +300,7 @@ class PopularMenuIntegrationTest {
 	@Test
 	void recordCompletedOrder_defersConsumptionWhileCacheIsRebuilding() {
 		Instant occurredAt = TODAY.atTime(3, 4).toInstant(ZoneOffset.UTC);
+		initializeCacheWindow();
 
 		assertThat(popularMenuCache.tryStartRebuild("rebuild-owner")).isTrue();
 		assertThatThrownBy(() -> popularMenuCache.recordCompletedOrder(104L, 3L, occurredAt))
@@ -341,6 +346,39 @@ class PopularMenuIntegrationTest {
 	}
 
 	@Test
+	void consumeOrderCompletedEvent_doesNotAcknowledgeMissingCacheStateAndRebuildsFromMySql() throws Exception {
+		Instant occurredAt = TODAY.atTime(3, 4).toInstant(ZoneOffset.UTC);
+		Instant eventOccurredAt = occurredAt.plus(Duration.ofHours(2L));
+		String scoreKey = "popular:menu:" + TODAY;
+		String stateKey = "popular:menu:state:" + TODAY;
+		Acknowledgment acknowledgment = mock(Acknowledgment.class);
+		insertPointAccount(REBUILD_USER_ID, 20_000L);
+		insertOrder(REBUILD_USER_ID, 3L, 5500L, occurredAt);
+		insertOrder(REBUILD_USER_ID, 3L, 5500L, occurredAt.plus(Duration.ofHours(1L)));
+		long orderId = insertOrder(REBUILD_USER_ID, 3L, 5500L, eventOccurredAt);
+		OrderCompletedEvent event = new OrderCompletedEvent(orderId, REBUILD_USER_ID, 3L, 5500L, eventOccurredAt);
+		initializeCacheWindow();
+		addOrderCount(TODAY, 3L, 2L);
+		assertThat(stringRedisTemplate.delete(List.of(scoreKey, stateKey))).isEqualTo(2L);
+
+		assertThatThrownBy(() -> popularMenuKafkaConsumer.consume(event, acknowledgment))
+				.isInstanceOf(PopularMenuUnavailableException.class);
+		then(acknowledgment).shouldHaveNoInteractions();
+
+		mockMvc.perform(get("/api/v1/menus/popular"))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.code").value("SUCCESS"))
+				.andExpect(jsonPath("$.data[0].menuId").value(3L))
+				.andExpect(jsonPath("$.data[0].orderCount").value(3L));
+
+		assertThat(stringRedisTemplate.opsForZSet().score(scoreKey, "3")).isEqualTo(3.0D);
+		Acknowledgment retriedAcknowledgment = mock(Acknowledgment.class);
+		popularMenuKafkaConsumer.consume(event, retriedAcknowledgment);
+		then(retriedAcknowledgment).should().acknowledge();
+		assertThat(stringRedisTemplate.opsForZSet().score(scoreKey, "3")).isEqualTo(3.0D);
+	}
+
+	@Test
 	void getPopularMenus_returnsEmptyArrayWhenNoAggregateExists() throws Exception {
 		mockMvc.perform(get("/api/v1/menus/popular"))
 				.andExpect(status().isOk())
@@ -355,7 +393,11 @@ class PopularMenuIntegrationTest {
 	}
 
 	private void initializeCacheWindow() {
-		for (LocalDate date = TODAY.minusDays(6L); !date.isAfter(TODAY); date = date.plusDays(1L)) {
+		initializeCacheWindow(TODAY);
+	}
+
+	private void initializeCacheWindow(LocalDate to) {
+		for (LocalDate date = to.minusDays(6L); !date.isAfter(to); date = date.plusDays(1L)) {
 			stringRedisTemplate.opsForValue().set("popular:menu:state:" + date, "EMPTY");
 		}
 	}
