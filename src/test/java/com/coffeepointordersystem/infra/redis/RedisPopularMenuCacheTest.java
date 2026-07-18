@@ -12,7 +12,9 @@ import static org.mockito.Mockito.when;
 import com.coffeepointordersystem.domain.menu.exception.PopularMenuUnavailableException;
 import com.coffeepointordersystem.domain.menu.port.PopularMenuRecordingResult;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.data.redis.RedisConnectionFailureException;
@@ -45,7 +47,7 @@ class RedisPopularMenuCacheTest {
 		);
 		assertThat(result).isEqualTo(PopularMenuRecordingResult.PROCESSED);
 		assertThat(((DefaultRedisScript<?>) scriptCaptor.getValue()).getScriptAsString())
-				.contains("TIME", "SET", "NX", "PXAT", "ZINCRBY", "PEXPIREAT");
+				.contains("EXISTS", "TIME", "SET", "NX", "PXAT", "ZINCRBY", "PEXPIREAT", "READY");
 	}
 
 	@Test
@@ -83,6 +85,16 @@ class RedisPopularMenuCacheTest {
 	}
 
 	@Test
+	void recordCompletedOrder_throwsWhenRebuildMarkerExists() {
+		StringRedisTemplate stringRedisTemplate = mock(StringRedisTemplate.class);
+		RedisPopularMenuCache cache = new RedisPopularMenuCache(stringRedisTemplate);
+		when(stringRedisTemplate.execute(any(RedisScript.class), anyList(), any(), any())).thenReturn(-2L);
+
+		assertThatThrownBy(() -> cache.recordCompletedOrder(ORDER_ID, MENU_ID, OCCURRED_AT))
+				.isInstanceOf(PopularMenuUnavailableException.class);
+	}
+
+	@Test
 	void recordCompletedOrder_throwsWhenRedisScriptFails() {
 		StringRedisTemplate stringRedisTemplate = mock(StringRedisTemplate.class);
 		RedisPopularMenuCache cache = new RedisPopularMenuCache(stringRedisTemplate);
@@ -93,8 +105,51 @@ class RedisPopularMenuCacheTest {
 				.isInstanceOf(PopularMenuUnavailableException.class);
 	}
 
+	@Test
+	void findOrderCounts_returnsCountsOnlyWhenEveryDateHasCompleteState() {
+		StringRedisTemplate stringRedisTemplate = mock(StringRedisTemplate.class);
+		RedisPopularMenuCache cache = new RedisPopularMenuCache(stringRedisTemplate);
+		when(stringRedisTemplate.execute(any(RedisScript.class), anyList()))
+				.thenReturn(List.of("READY", "3", "5", "4", "2"));
+
+		Map<Long, Long> orderCounts = cache.findOrderCounts(
+				LocalDate.parse("2026-07-14"),
+				LocalDate.parse("2026-07-15")
+		);
+
+		assertThat(orderCounts).containsExactlyInAnyOrderEntriesOf(Map.of(3L, 5L, 4L, 2L));
+		then(stringRedisTemplate).should().execute(
+				any(RedisScript.class),
+				eq(List.of(
+						"popular:menu:rebuilding",
+						"popular:menu:state:2026-07-14",
+						"popular:menu:2026-07-14",
+						"popular:menu:state:2026-07-15",
+						"popular:menu:2026-07-15"
+				))
+		);
+	}
+
+	@Test
+	void findOrderCounts_throwsWhenRedisReportsIncompleteState() {
+		StringRedisTemplate stringRedisTemplate = mock(StringRedisTemplate.class);
+		RedisPopularMenuCache cache = new RedisPopularMenuCache(stringRedisTemplate);
+		when(stringRedisTemplate.execute(any(RedisScript.class), anyList())).thenReturn(List.of("UNAVAILABLE"));
+
+		assertThatThrownBy(() -> cache.findOrderCounts(
+					LocalDate.parse("2026-07-15"),
+					LocalDate.parse("2026-07-15")
+		))
+				.isInstanceOf(PopularMenuUnavailableException.class);
+	}
+
 	private List<String> eqKeys() {
-		return List.of("popular:menu:processed:2026-07-15:101", "popular:menu:2026-07-15");
+		return List.of(
+				"popular:menu:rebuilding",
+				"popular:menu:processed:2026-07-15:101",
+				"popular:menu:2026-07-15",
+				"popular:menu:state:2026-07-15"
+		);
 	}
 
 }
