@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.BDDMockito.then;
 import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -13,6 +14,7 @@ import com.coffeepointordersystem.domain.menu.exception.PopularMenuUnavailableEx
 import com.coffeepointordersystem.domain.menu.port.PopularMenuCache;
 import com.coffeepointordersystem.domain.menu.port.PopularMenuRecordingResult;
 import com.coffeepointordersystem.domain.order.event.OrderCompletedEvent;
+import com.coffeepointordersystem.infra.kafka.PopularMenuKafkaConsumer;
 import com.coffeepointordersystem.infra.redis.RedisPopularMenuCache;
 import java.time.Clock;
 import java.time.Duration;
@@ -45,6 +47,7 @@ import org.springframework.context.annotation.Primary;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -95,6 +98,9 @@ class PopularMenuIntegrationTest {
 
 	@Autowired
 	private PopularMenuCache popularMenuCache;
+
+	@Autowired
+	private PopularMenuKafkaConsumer popularMenuKafkaConsumer;
 
 	@MockitoSpyBean
 	private RedisPopularMenuCache redisPopularMenuCache;
@@ -302,6 +308,39 @@ class PopularMenuIntegrationTest {
 	}
 
 	@Test
+	void consumeOrderCompletedEvent_doesNotAcknowledgeIncompleteCacheAndRebuildsFromMySql() throws Exception {
+		Instant occurredAt = TODAY.atTime(3, 4).toInstant(ZoneOffset.UTC);
+		Instant eventOccurredAt = occurredAt.plus(Duration.ofHours(2L));
+		String scoreKey = "popular:menu:" + TODAY;
+		Acknowledgment acknowledgment = mock(Acknowledgment.class);
+		insertPointAccount(REBUILD_USER_ID, 20_000L);
+		insertOrder(REBUILD_USER_ID, 3L, 5500L, occurredAt);
+		insertOrder(REBUILD_USER_ID, 3L, 5500L, occurredAt.plus(Duration.ofHours(1L)));
+		long orderId = insertOrder(REBUILD_USER_ID, 3L, 5500L, eventOccurredAt);
+		OrderCompletedEvent event = new OrderCompletedEvent(orderId, REBUILD_USER_ID, 3L, 5500L, eventOccurredAt);
+		initializeCacheWindow();
+		addOrderCount(TODAY, 3L, 2L);
+		assertThat(stringRedisTemplate.opsForValue().get("popular:menu:state:" + TODAY)).isEqualTo("READY");
+		assertThat(stringRedisTemplate.delete(scoreKey)).isTrue();
+
+		assertThatThrownBy(() -> popularMenuKafkaConsumer.consume(event, acknowledgment))
+				.isInstanceOf(PopularMenuUnavailableException.class);
+		then(acknowledgment).shouldHaveNoInteractions();
+
+		mockMvc.perform(get("/api/v1/menus/popular"))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.code").value("SUCCESS"))
+				.andExpect(jsonPath("$.data[0].menuId").value(3L))
+				.andExpect(jsonPath("$.data[0].orderCount").value(3L));
+
+		assertThat(stringRedisTemplate.opsForZSet().score(scoreKey, "3")).isEqualTo(3.0D);
+		Acknowledgment retriedAcknowledgment = mock(Acknowledgment.class);
+		popularMenuKafkaConsumer.consume(event, retriedAcknowledgment);
+		then(retriedAcknowledgment).should().acknowledge();
+		assertThat(stringRedisTemplate.opsForZSet().score(scoreKey, "3")).isEqualTo(3.0D);
+	}
+
+	@Test
 	void getPopularMenus_returnsEmptyArrayWhenNoAggregateExists() throws Exception {
 		mockMvc.perform(get("/api/v1/menus/popular"))
 				.andExpect(status().isOk())
@@ -371,12 +410,18 @@ class PopularMenuIntegrationTest {
 		);
 	}
 
-	private void insertOrder(String userId, long menuId, long paidAmount, Instant orderedAt) {
+	private long insertOrder(String userId, long menuId, long paidAmount, Instant orderedAt) {
 		jdbcTemplate.update(
 				"INSERT INTO orders (user_id, menu_id, paid_amount, ordered_at) VALUES (?, ?, ?, ?)",
 				userId,
 				menuId,
 				paidAmount,
+				orderedAt
+		);
+		return jdbcTemplate.queryForObject(
+				"SELECT id FROM orders WHERE user_id = ? AND ordered_at = ?",
+				Long.class,
+				userId,
 				orderedAt
 		);
 	}
