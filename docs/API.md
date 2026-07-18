@@ -4,7 +4,8 @@
 
 이 문서는 `docs/PRD.md`의 `원 과제 최소·제출 요구사항` 절과 P0 범위를 HTTP API와 Kafka 이벤트 계약으로
 구체화한다.
-`reference/API_TEMPLATE.md`의 문서 구조를 따르며, P1과 P2 기능은 현재 계약에 포함하지 않는다.
+`reference/API_TEMPLATE.md`의 문서 구조를 따른다. P1과 P2 기능은 현재 요청·응답 schema에 포함하지 않으며,
+P2 M8은 schema를 바꾸지 않는 Redis 장애·fallback 정책으로만 기록한다.
 
 ### 요구사항 추적
 
@@ -481,7 +482,7 @@ Accept: application/json
 
 집계 대상 주문이 없으면 `200 OK`와 `data: []`을 반환한다.
 
-### Redis 장애 계약
+### Redis 장애와 M8 cache 상태 계약
 
 P0에서는 Redis timeout, 연결 실패 또는 조회 불가 시 MySQL로 fallback하지 않는다.
 `503 Service Unavailable`과 `POPULAR_MENU_UNAVAILABLE`을 반환한다.
@@ -489,14 +490,21 @@ P0에서는 Redis timeout, 연결 실패 또는 조회 불가 시 MySQL로 fallb
 Redis가 정상 응답했지만 key가 없으면 해당 날짜의 주문이 없는 것으로 처리한다. P0는 Redis 데이터 유실을
 자동 탐지하거나 복구하지 않는다.
 
-P2 M8에서 MySQL fallback과 Redis 재구성을 도입한다. fallback이 도입되어도 정상 응답 schema, 집계 기간과
-정렬 규칙은 변경하지 않는다.
+P2 M8에서는 각 집계 날짜의 상태 key와 점수 key 조합이 완전한 Redis 조회 모델인지 확인한다. 상태 key가 없거나
+상태와 점수 key가 맞지 않으면 데이터 유실 또는 개별 key eviction으로 인한 cache 불완전 상태로 판단한다.
+Redis timeout, 연결·명령 실행 실패와 cache 불완전 상태에서는 MySQL로 최근 7개 UTC 날짜의 결제 완료 주문을
+집계해 `200 OK`와 기존 성공 응답 body를 반환한다. fallback 여부를 나타내는 header·field는 추가하지 않는다.
+
+다른 인스턴스가 Redis를 재구성 중임을 나타내는 표식이 있으면 Redis 부분 결과를 반환하지 않고 같은 MySQL
+fallback 규칙을 적용한다. fallback이 도입되어도 정상 응답 schema, 집계 기간과 정렬 규칙은 변경하지 않는다.
+MySQL 집계도 실패한 경우에만 `503 Service Unavailable`과 `POPULAR_MENU_UNAVAILABLE`을 반환하며, 부분 결과나
+이전 Redis 결과를 성공 응답으로 반환하지 않는다.
 
 ### Error Code
 
 | HTTP Status | Code | Description |
 | --- | --- | --- |
-| 503 | `POPULAR_MENU_UNAVAILABLE` | P0에서 Redis 장애로 인기 메뉴를 조회할 수 없음 |
+| 503 | `POPULAR_MENU_UNAVAILABLE` | P0 Redis 장애 또는 M8 fallback MySQL 집계 실패로 인기 메뉴를 조회할 수 없음 |
 | 500 | `INTERNAL_SERVER_ERROR` | 공개 가능한 도메인 오류로 분류되지 않은 서버 오류 |
 
 #### Error Response Body
