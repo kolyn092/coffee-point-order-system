@@ -3,8 +3,10 @@ package com.coffeepointordersystem.domain.menu.service;
 import com.coffeepointordersystem.domain.menu.dto.MenuListResponse;
 import com.coffeepointordersystem.domain.menu.dto.PopularMenuResponse;
 import com.coffeepointordersystem.domain.menu.entity.Menu;
+import com.coffeepointordersystem.domain.menu.exception.PopularMenuUnavailableException;
 import com.coffeepointordersystem.domain.menu.port.PopularMenuCache;
 import com.coffeepointordersystem.domain.menu.repository.MenuRepository;
+import com.coffeepointordersystem.domain.menu.repository.PopularMenuQueryRepository;
 import java.time.Clock;
 import java.time.LocalDate;
 import java.util.Map;
@@ -19,15 +21,21 @@ public class MenuService {
 
 	private final MenuRepository menuRepository;
 	private final PopularMenuCache popularMenuCache;
+	private final PopularMenuQueryRepository popularMenuQueryRepository;
+	private final PopularMenuCacheRebuildService popularMenuCacheRebuildService;
 	private final Clock clock;
 
 	public MenuService(
 			MenuRepository menuRepository,
 			PopularMenuCache popularMenuCache,
+			PopularMenuQueryRepository popularMenuQueryRepository,
+			PopularMenuCacheRebuildService popularMenuCacheRebuildService,
 			Clock clock
 	) {
 		this.menuRepository = menuRepository;
 		this.popularMenuCache = popularMenuCache;
+		this.popularMenuQueryRepository = popularMenuQueryRepository;
+		this.popularMenuCacheRebuildService = popularMenuCacheRebuildService;
 		this.clock = clock;
 	}
 
@@ -42,7 +50,8 @@ public class MenuService {
 	@Transactional(readOnly = true)
 	public List<PopularMenuResponse> findPopularMenus() {
 		LocalDate to = LocalDate.now(clock);
-		Map<Long, Long> orderCounts = popularMenuCache.findOrderCounts(to.minusDays(6L), to);
+		LocalDate from = to.minusDays(6L);
+		Map<Long, Long> orderCounts = findOrderCounts(from, to);
 		Map<Long, Menu> menusById = menuRepository.findAllById(orderCounts.keySet())
 				.stream()
 				.collect(Collectors.toMap(Menu::getId, Function.identity()));
@@ -55,6 +64,16 @@ public class MenuService {
 				.limit(3L)
 				.map(entry -> PopularMenuResponse.from(menusById.get(entry.getKey()), entry.getValue()))
 				.toList();
+	}
+
+	private Map<Long, Long> findOrderCounts(LocalDate from, LocalDate to) {
+		try {
+			return popularMenuCache.findOrderCounts(from, to);
+		} catch (PopularMenuUnavailableException exception) {
+			Map<Long, Long> orderCounts = popularMenuQueryRepository.findOrderCounts(from, to);
+			popularMenuCacheRebuildService.rebuildIfPossible(from, to);
+			return orderCounts;
+		}
 	}
 
 }
