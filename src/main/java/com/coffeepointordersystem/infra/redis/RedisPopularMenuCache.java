@@ -58,9 +58,9 @@ public class RedisPopularMenuCache implements PopularMenuCache {
 
 					local state = redis.call('GET', KEYS[4])
 					local scoreExists = redis.call('EXISTS', KEYS[3])
-					if (state == 'READY' and scoreExists == 0)
+					if not state
+							or (state == 'READY' and scoreExists == 0)
 							or (state == 'EMPTY' and scoreExists == 1)
-							or (not state and scoreExists == 1)
 							or (state and state ~= 'READY' and state ~= 'EMPTY') then
 						return -2
 					end
