@@ -9,15 +9,17 @@ import org.springframework.stereotype.Component;
 @Component
 public class PopularMenuKafkaConsumer {
 
-	private static final String ORDER_COMPLETED_TOPIC = "order.completed";
-
 	private final PopularMenuCache popularMenuCache;
 
 	public PopularMenuKafkaConsumer(PopularMenuCache popularMenuCache) {
 		this.popularMenuCache = popularMenuCache;
 	}
 
-	@KafkaListener(topics = ORDER_COMPLETED_TOPIC, containerFactory = "popularMenuKafkaListenerContainerFactory")
+	@KafkaListener(
+			topics = OrderCompletedKafkaTopicConfig.ORDER_COMPLETED_TOPIC,
+			containerFactory = "popularMenuKafkaListenerContainerFactory",
+			autoStartup = "${popular-menu.consumer.enabled:true}"
+	)
 	public void consume(OrderCompletedEvent event, Acknowledgment acknowledgment) {
 		popularMenuCache.recordCompletedOrder(event.orderId(), event.menuId(), event.occurredAt());
 		acknowledgment.acknowledge();

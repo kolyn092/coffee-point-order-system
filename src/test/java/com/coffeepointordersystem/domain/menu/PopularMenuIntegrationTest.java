@@ -14,6 +14,7 @@ import com.coffeepointordersystem.domain.menu.exception.PopularMenuUnavailableEx
 import com.coffeepointordersystem.domain.menu.port.PopularMenuCache;
 import com.coffeepointordersystem.domain.menu.port.PopularMenuRecordingResult;
 import com.coffeepointordersystem.domain.order.event.OrderCompletedEvent;
+import com.coffeepointordersystem.infra.kafka.OrderCompletedKafkaTopicConfig;
 import com.coffeepointordersystem.infra.kafka.PopularMenuKafkaConsumer;
 import com.coffeepointordersystem.infra.redis.RedisPopularMenuCache;
 import java.time.Clock;
@@ -61,7 +62,7 @@ import org.testcontainers.kafka.KafkaContainer;
 import org.testcontainers.utility.DockerImageName;
 
 @Testcontainers
-@SpringBootTest
+@SpringBootTest(properties = "popular-menu.consumer.concurrency=3")
 @AutoConfigureMockMvc
 @Import(PopularMenuIntegrationTest.FixedClockConfig.class)
 class PopularMenuIntegrationTest {
@@ -152,6 +153,32 @@ class PopularMenuIntegrationTest {
 		long remainingSeconds = stringRedisTemplate.getExpire(key);
 		long expectedRemainingSeconds = Duration.between(Instant.now(), expectedExpiration).toSeconds();
 		assertThat(remainingSeconds).isBetween(expectedRemainingSeconds - 5L, expectedRemainingSeconds + 1L);
+	}
+
+	@Test
+	void consumeSameOrderCompletedEventFromThreePartitions_incrementsRedisScoreOnce() throws Exception {
+		Instant occurredAt = Instant.now().plus(Duration.ofDays(1L));
+		LocalDate occurredDate = occurredAt.atZone(ZoneOffset.UTC).toLocalDate();
+		String scoreKey = "popular:menu:" + occurredDate;
+		OrderCompletedEvent event = new OrderCompletedEvent(
+				105L,
+				"popular-menu-user",
+				3L,
+				5_500L,
+				occurredAt
+		);
+		initializeCacheWindow(occurredDate);
+
+		for (int partition = 0; partition < OrderCompletedKafkaTopicConfig.PARTITION_COUNT; partition++) {
+			kafkaTemplate.send(
+					ORDER_COMPLETED_TOPIC,
+					partition,
+					"same-order-" + partition,
+					event
+			).get(10L, TimeUnit.SECONDS);
+		}
+
+		assertThat(awaitOrderCount(scoreKey, 3L)).isEqualTo(1.0D);
 	}
 
 	@Test
@@ -424,7 +451,11 @@ class PopularMenuIntegrationTest {
 				KAFKA.getBootstrapServers()
 		))) {
 			try {
-				adminClient.createTopics(List.of(new NewTopic(ORDER_COMPLETED_TOPIC, 1, (short) 1)))
+				adminClient.createTopics(List.of(new NewTopic(
+						ORDER_COMPLETED_TOPIC,
+						OrderCompletedKafkaTopicConfig.PARTITION_COUNT,
+						(short) 1
+				)))
 						.all()
 						.get(10L, TimeUnit.SECONDS);
 			} catch (ExecutionException exception) {
