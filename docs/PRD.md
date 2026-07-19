@@ -204,6 +204,13 @@ API 요청·응답과 오류는 `docs/API.md`, 데이터 모델과 DB 제약은 
 - 테스트 데이터는 전용 환경에만 준비한다. migration의 메뉴를 사용하고, 유효한 사용자 계정과 충분한 포인트를
   사전에 충전한다. Redis `FLUSHALL`, broker 중단과 볼륨 정리는 전용 Compose 프로젝트에서만 허용하며 공유 개발·운영
   환경에는 실행하지 않는다.
+- `order.completed`는 새 환경에서 3개 파티션과 복제 계수 1로 생성한다. 인기 메뉴 listener의 기본 병렬도는 1이고,
+  3개 파티션을 상한으로 설정한다. 이미 생성된 Kafka 토픽의 파티션 수는 줄일 수 없으므로, 3개보다 많은 기존 토픽을
+  이 정책에 맞추기 위해 재사용하지 않는다.
+- Consumer Group 확장 비교는 한 애플리케이션 인스턴스의 listener 병렬도를 1·2·3으로 바꾸고 다른 인스턴스의
+  listener를 비활성화해 Group 전체의 활성 Consumer 수를 제어한다. HTTP 처리 인스턴스 수와 이벤트·Outbox·Redis
+  계약은 바꾸지 않는다. Kafka는 파티션 하나를 같은 Group의 Consumer 하나에만 할당하므로 4개 이상을 실행하면
+  3개만 파티션을 받고 나머지는 유휴 상태가 된다. 3개를 넘는 listener 병렬도는 이 단계에서 허용하지 않는다.
 
 ##### 시나리오와 관측 기간
 
@@ -213,6 +220,7 @@ API 요청·응답과 오류는 `docs/API.md`, 데이터 모델과 DB 제약은 
 | 동일 사용자 경합 | 30 VU가 한 사용자에 대해 충전과 주문을 3분간 요청한다. | 포인트 계정 비관적 행 잠금, 잔액·주문 정합성과 lock 병목 |
 | Redis fallback·재구성 | 30 VU의 인기 메뉴 조회 중 Redis 연결 장애를 1분간 만들고 복구한다. 별도 실행에서는 전용 Redis 데이터를 비워 상태 key 유실을 재현한다. | MySQL fallback, 단일 재구성 소유권, 재구성 중 consumer lag |
 | Kafka 전송 실패·복구 | 10 VU의 주문을 3분간 실행하면서 Kafka broker를 1분간 중단했다가 복구한다. | 최초·재시도 게시 실패, `PENDING` 누적과 최종 `PUBLISHED`, consumer lag 해소 |
+| Consumer Group 확장 | 같은 600건 주문 부하를 1·2·3개의 활성 Consumer에서 각각 세 번 실행한다. | 처리 완료 시간·초당 소비량, partition별·합계 lag, 파티션 할당 상한과 Redis 중복 처리 |
 
 ##### 관측 항목과 판정
 
@@ -221,7 +229,7 @@ API 요청·응답과 오류는 `docs/API.md`, 데이터 모델과 DB 제약은 
 | HTTP와 병목 | k6의 요청 수, 초당 요청 수, `http_req_duration` p50·p95·p99, `http_req_failed`를 실행 종료 때 기록한다. 컨테이너 CPU·메모리는 5초마다 기록한다. | 다음 VU 단계에서 처리량 증가는 10% 미만인데 p95가 50% 이상 증가하거나, 한 컨테이너 자원이 1분 이상 80%를 넘으면 병목 후보로 기록한다. 이는 실패 판정이 아니라 후속 개선 대상이다. |
 | 주문 정합성 | k6 성공 응답 수, `orders`, `outbox_events`, 사용자별 포인트 잔액을 시나리오 종료 뒤 대조한다. | 유효 요청의 의도하지 않은 비-2xx 응답은 실패다. 성공 주문 수와 새 주문·Outbox 행 수가 같고, 각 잔액이 성공 충전액 합계에서 성공 주문 결제액 합계를 뺀 값과 같아야 한다. |
 | Kafka 전송 실패와 `PENDING` | 최초 발행의 `주문 완료 이벤트 발행에 실패했습니다.` 로그와 재시도의 `PENDING Outbox 이벤트 재시도에 실패했습니다.` 로그 수, `PENDING` 행 수와 가장 오래된 `created_at`을 5초마다 기록한다. | 의도하지 않은 전송 실패 로그는 실패다. Kafka 중단 시에는 실패 로그와 `PENDING` 증가를 확인해야 하며, 복구 후 5분 안에 새 `PENDING` 행이 없어지고 모든 대상 행이 `PUBLISHED`여야 한다. |
-| Kafka consumer lag | `popular-menu` consumer group의 partition별 lag와 합계를 5초마다 기록한다. | 일반 흐름 종료 뒤 lag는 0이어야 한다. Redis 재구성 또는 Kafka 장애 중 증가한 lag도 복구 후 5분 안에 0으로 돌아와야 한다. |
+| Kafka consumer lag | `popular-menu` consumer group의 partition별 lag와 합계를 5초마다 기록한다. Consumer Group 확장 실행은 별도 Group의 활성 Consumer·partition 할당도 함께 기록한다. | 일반 흐름 종료 뒤 lag는 0이어야 한다. Redis 재구성 또는 Kafka 장애 중 증가한 lag도 복구 후 5분 안에 0으로 돌아와야 한다. Consumer Group 확장도 각 실행 뒤 5분 안에 lag가 0이어야 하며, 활성 Consumer와 할당 파티션 수는 모두 3을 넘을 수 없다. |
 | 인기 메뉴 결과 | lag가 0이 된 뒤 MySQL 최근 7개 UTC 날짜 집계와 인기 메뉴 API의 Top 3·정렬·주문 수를 대조한다. | Redis 정상·fallback·재구성 뒤 모두 MySQL 원본과 같은 결과여야 하며, Redis 장애 중 부분 결과나 `503` 응답은 실패다. |
 
 - 모든 시나리오는 같은 Git commit과 같은 환경에서 세 번 실행하고, 각 지표의 중앙값과 최댓값을 보고한다. 장비 성능이
@@ -229,8 +237,9 @@ API 요청·응답과 오류는 `docs/API.md`, 데이터 모델과 DB 제약은 
 - 실행마다 `docs/load-test/results/<UTC-실행식별자>/summary.json`에 k6 원본 요약을, 같은 경로의 `report.md`에
   환경·이미지·k6 버전·commit, 실행 명령, 데이터 준비·장애 주입 시각, 시나리오별 지표, 판정과 병목 후보를 기록한다.
   `report.md`는 원본 JSON의 파일명과 SHA-256도 포함해 결과를 재현 가능하게 연결한다.
-- 후속 구현 이슈는 k6 스크립트, 2개 애플리케이션·로드밸런서 Compose 구성, 5초 관측 수집과 결과 생성 자동화를 만든다.
-  이 이슈에는 해당 도구·스크립트·대시보드·알림을 추가하지 않는다.
+- 부하 테스트 구현은 k6 스크립트, 2개 애플리케이션·로드밸런서 Compose 구성, 5초 관측 수집과 결과 생성 자동화를
+  사용한다. Consumer Group 확장 결과는 Consumer 수별 보고서와 중앙 비교 보고서로 남긴다. 대시보드와 알림은 이
+  단계에 추가하지 않는다.
 
 ### 다중 서버
 

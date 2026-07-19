@@ -38,12 +38,32 @@ bash ./scripts/load-test/invoke-load-test.sh --scenario all
 | `redis-connection` | 인기 메뉴 조회 30 VU를 3분 | 실행 1분 뒤 Redis를 1분 중단·복구 |
 | `redis-data-loss` | 인기 메뉴 조회 30 VU를 3분 | 실행 1분 뒤 전용 Redis에 `FLUSHALL` |
 | `kafka-recovery` | 주문 10 VU를 3분 | 실행 1분 뒤 Kafka broker를 1분 중단·복구 |
+| `consumer-scaling` | 같은 600건 주문을 30 VU로 1·2·3 Consumer에서 각각 세 번 실행 | 없음 |
 
 예를 들어 Kafka 복구 시나리오만 세 번 실행하려면 다음과 같이 실행한다.
 
 ```bash
 bash ./scripts/load-test/invoke-load-test.sh --scenario kafka-recovery
 ```
+
+### Consumer Group 확장 비교
+
+`consumer-scaling`은 `order.completed`의 3개 파티션을 대상으로 같은 600건 주문을 Consumer 수 1·2·3에서 각각
+세 번 처리한다. 각 실행은 `popular-menu-scaling-<실행 식별자>` Group을 새로 사용하고, `app-1`의 listener 병렬도를
+1·2·3으로 설정한다. `app-2`는 HTTP 요청을 계속 처리하지만 listener는 비활성화해 Group 전체 활성 Consumer 수가
+실행별 설정값과 같도록 한다.
+
+```bash
+bash ./scripts/load-test/invoke-load-test.sh --scenario consumer-scaling
+```
+
+기본 주문 수는 `CONSUMER_SCALING_ITERATIONS=600`이다. 값을 바꿀 때는 한 번의 명령에서 모든 Consumer 수에 같은 값을
+적용해야 하며, 결과 보고서의 데이터 준비와 실행 명령을 함께 보관한다.
+
+애플리케이션은 `order.completed`를 새 환경에서 파티션 3개, 복제 계수 1로 생성한다. `popular-menu.consumer.concurrency`
+기본값은 1이고 상한은 3이다. 이미 생성된 Kafka 토픽의 파티션 수는 줄일 수 없으므로, 3개보다 많은 기존 토픽을 이
+실험의 대상으로 재사용하지 않는다. Kafka는 같은 Consumer Group에서 파티션 하나를 동시에 둘 이상의 Consumer에
+할당하지 않는다. 따라서 4개 이상의 Consumer를 실행하면 최대 3개만 파티션을 받고 나머지는 유휴 상태가 된다.
 
 진단을 위해 종료 후 환경을 유지해야 할 때만 `--keep-environment`를 추가한다. 기본 동작은 종료 시 전용 컨테이너와
 전용 volume을 정리한다.
@@ -55,6 +75,7 @@ bash ./scripts/load-test/invoke-load-test.sh --scenario kafka-recovery
 - 각 컨테이너의 CPU·메모리 사용량
 - Outbox `PENDING` 개수와 가장 오래된 생성 시각
 - `popular-menu` consumer group의 partition별·합계 lag
+- Consumer Group 확장 실행의 설정 Consumer 수, 활성 Consumer 수와 Consumer별 파티션 할당
 - 최초 게시와 재시도 게시 실패 로그 수
 
 k6 종료 뒤에는 요청 수, 초당 요청 수, `http_req_duration` p50·p95·p99, `http_req_failed`를 기록한다. 또한 다음을
@@ -91,8 +112,10 @@ docs/load-test/results/<UTC-실행식별자>/report.md
 
 `summary.json`은 k6 원본 요약이며, `metrics.json`은 사용자별 성공 충전·주문 금액과 혼합 흐름 단계 지표를 재계산하는
 원본이다. `report.md`에는 Git commit, k6·Docker Engine·Docker Compose 버전, 각 컨테이너의 이미지 참조와 이미지 ID,
-데이터 준비, 장애 주입·복구 시각, 검증 판정, 병목 후보와 두 JSON 파일의 SHA-256을 남긴다. 세 번의 실행이 끝나면
-같은 결과 루트에 시나리오별 중앙값·최댓값 집계 보고서도 생성된다.
+데이터 준비, 장애 주입·복구 시각, 검증 판정, 병목 후보와 두 JSON 파일의 SHA-256을 남긴다. Consumer Group 확장
+보고서는 설정·활성 Consumer 수, Consumer별 파티션 할당, lag 0 도달 시간과 주문당 처리량도 남긴다. 세 번의 실행이
+끝나면 같은 결과 루트에 시나리오별 중앙값·최댓값 집계 보고서가 생성되고, Consumer Group 확장은 1·2·3 Consumer
+결과를 한 표에서 비교한 중앙 보고서도 생성된다.
 
 결과를 재현할 때는 `report.md`의 commit, 실행 명령, Docker·Compose·k6 버전, 이미지 ID와 SHA-256이 같은지 먼저
 확인한다. 장비가 고정되지 않으므로 절대 p95 SLA는 이 문서에서 채택하지 않는다.
