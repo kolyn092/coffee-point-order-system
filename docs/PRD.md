@@ -220,7 +220,7 @@ API 요청·응답과 오류는 `docs/API.md`, 데이터 모델과 DB 제약은 
 | 동일 사용자 경합 | 30 VU가 한 사용자에 대해 충전과 주문을 3분간 요청한다. | 포인트 계정 비관적 행 잠금, 잔액·주문 정합성과 lock 병목 |
 | Redis fallback·재구성 | 30 VU의 인기 메뉴 조회 중 Redis 연결 장애를 1분간 만들고 복구한다. 별도 실행에서는 전용 Redis 데이터를 비워 상태 key 유실을 재현한다. | MySQL fallback, 단일 재구성 소유권, 재구성 중 consumer lag |
 | Kafka 전송 실패·복구 | 10 VU의 주문을 3분간 실행하면서 Kafka broker를 1분간 중단했다가 복구한다. | 최초·재시도 게시 실패, `PENDING` 누적과 최종 `PUBLISHED`, consumer lag 해소 |
-| Consumer Group 확장 | 같은 600건 주문 부하를 1·2·3개의 활성 Consumer에서 각각 세 번 실행한다. | 처리 완료 시간·초당 소비량, partition별·합계 lag, 파티션 할당 상한과 Redis 중복 처리 |
+| Consumer Group 확장 | 같은 600건 주문 부하를 1·2·3개의 활성 Consumer에서 각각 세 번 실행한다. | 종단간 완료 시간·처리량, k6 종료 후 lag 0 도달 시간, partition별·합계 lag, 파티션 할당 상한과 Redis 중복 처리 |
 
 ##### 관측 항목과 판정
 
@@ -234,6 +234,9 @@ API 요청·응답과 오류는 `docs/API.md`, 데이터 모델과 DB 제약은 
 
 - 모든 시나리오는 같은 Git commit과 같은 환경에서 세 번 실행하고, 각 지표의 중앙값과 최댓값을 보고한다. 장비 성능이
   고정되지 않았으므로 절대 p95 SLA는 이 단계에서 채택하지 않는다.
+- Consumer Group 확장의 종단간 완료 시간은 k6 시작부터 새 `PENDING = 0`과 consumer lag `= 0`을 처음 관측할 때까지이며,
+  종단간 처리량은 성공 주문 수를 이 시간으로 나눈 값이다. 이 두 지표에는 HTTP·Outbox 발행 시간이 포함된다. 별도로
+  k6 종료부터 같은 안정 상태까지의 lag 0 도달 시간을 기록해 Consumer가 부하 종료 뒤 처리한 잔여 시간을 구분한다.
 - 실행마다 `docs/load-test/results/<UTC-실행식별자>/summary.json`에 k6 원본 요약을, 같은 경로의 `report.md`에
   환경·이미지·k6 버전·commit, 실행 명령, 데이터 준비·장애 주입 시각, 시나리오별 지표, 판정과 병목 후보를 기록한다.
   `report.md`는 원본 JSON의 파일명과 SHA-256도 포함해 결과를 재현 가능하게 연결한다.

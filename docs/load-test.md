@@ -87,6 +87,11 @@ MySQL 원본과 대조한다.
 - 모든 새 Outbox의 최종 `PUBLISHED` 상태
 - lag가 0이 된 뒤 인기 메뉴 API의 Top 3·동점 정렬·주문 수
 
+Consumer Group 확장 보고서는 k6 시작부터 `PENDING = 0`과 consumer lag `= 0`을 처음 관측할 때까지의 종단간 완료 시간과
+성공 주문 수를 그 시간으로 나눈 종단간 처리량을 기록한다. 이 지표에는 HTTP 요청과 Outbox 발행 시간이 포함되므로
+Consumer만의 처리량으로 해석하지 않는다. 별도로 k6 종료부터 같은 안정 상태까지의 lag 0 도달 시간을 기록해 부하 종료 뒤
+Consumer가 처리한 잔여 시간을 비교한다.
+
 Redis 연결 장애와 Kafka broker 중단은 서비스 복구를 기록한 시각부터 5분 안에 `PENDING = 0` 및 consumer lag `= 0`이
 되어야 한다. k6 종료 시각부터 대기 시간을 새로 계산하지 않는다. Kafka 중단 직전의 `PENDING`·lag를 기준값으로 남기고,
 장애 주입 뒤 관측한 최댓값이 각각 기준값보다 증가해야 한다. 최초·재시도 게시 실패 로그, 증가한 `PENDING`과 lag,
@@ -114,9 +119,9 @@ docs/load-test/results/<UTC-실행식별자>/report.md
 `summary.json`은 k6 원본 요약이며, `metrics.json`은 사용자별 성공 충전·주문 금액과 혼합 흐름 단계 지표를 재계산하는
 원본이다. `report.md`에는 Git commit, k6·Docker Engine·Docker Compose 버전, 각 컨테이너의 이미지 참조와 이미지 ID,
 데이터 준비, 장애 주입·복구 시각, 검증 판정, 병목 후보와 두 JSON 파일의 SHA-256을 남긴다. Consumer Group 확장
-보고서는 설정·활성 Consumer 수, Consumer별 파티션 할당, lag 0 도달 시간과 주문당 처리량도 남긴다. 세 번의 실행이
-끝나면 같은 결과 루트에 시나리오별 중앙값·최댓값 집계 보고서가 생성되고, Consumer Group 확장은 1·2·3 Consumer
-결과를 한 표에서 비교한 중앙 보고서도 생성된다.
+보고서는 설정·활성 Consumer 수, Consumer별 파티션 할당, k6 종료 후 lag 0 도달 시간, 종단간 완료 시간과 종단간
+처리량도 남긴다. 세 번의 실행이 끝나면 같은 결과 루트에 시나리오별 중앙값·최댓값 집계 보고서가 생성되고, Consumer
+Group 확장은 1·2·3 Consumer 결과를 한 표에서 비교한 중앙 보고서도 생성된다.
 
 결과를 재현할 때는 `report.md`의 commit, 실행 명령, Docker·Compose·k6 버전, 이미지 ID와 SHA-256이 같은지 먼저
 확인한다. 장비가 고정되지 않으므로 절대 p95 SLA는 이 문서에서 채택하지 않는다.
