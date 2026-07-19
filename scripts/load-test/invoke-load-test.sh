@@ -831,10 +831,11 @@ kafka_lag_measurements() {
     jq -sr '
         [.[] | .kafkaLag.totalLag | select(type == "number")] as $lags
         | if ($lags | length) == 0 then
-              "0\\t0"
+              [0, 0]
           else
-              "\($lags | max)\\t\($lags | last)"
+              [($lags | max), ($lags | last)]
           end
+        | @tsv
     ' "$observation_path"
 }
 

@@ -15,6 +15,23 @@ export LOAD_TEST_RESULTS_ROOT="$TEST_RESULTS_ROOT"
 # shellcheck source=invoke-load-test.sh
 source "$SCRIPT_DIRECTORY/invoke-load-test.sh"
 
+assert_equals() {
+    local expected="$1"
+    local actual="$2"
+    local description="$3"
+
+    [[ "$actual" == "$expected" ]] \
+        || { echo "$description: 기대=$expected, 실제=$actual" >&2; exit 1; }
+}
+
+lag_observation_path="$TEST_RESULTS_ROOT/lag-observations.ndjson"
+printf '%s\n' \
+    '{"kafkaLag":{"totalLag":12}}' \
+    '{"kafkaLag":{"totalLag":0}}' > "$lag_observation_path"
+IFS=$'\t' read -r maximum_kafka_lag final_kafka_lag < <(kafka_lag_measurements "$lag_observation_path")
+assert_equals '12' "$maximum_kafka_lag" '최대 Kafka lag 분리'
+assert_equals '0' "$final_kafka_lag" '최종 Kafka lag 분리'
+
 jq() {
     case "$*" in
         *'.activeConsumerCount'*)
