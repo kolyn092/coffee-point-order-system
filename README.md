@@ -15,15 +15,16 @@ Spring Boot 애플리케이션이다. 제품 요구사항과 단계별 범위는
 
 ## 로컬 실행
 
-저장소 루트에서 다음 명령으로 MySQL, Redis와 Kafka를 실행한다.
+저장소 루트에서 다음 명령으로 MySQL, Redis, Kafka와 Kafka UI를 실행한다.
 
 ```shell
 docker compose up -d
 docker compose ps
 ```
 
-서비스 포트는 MySQL `3306`, Redis `6379`, Kafka `29092`이다. 애플리케이션은 기본값으로 호스트의
-세 서비스에 연결하며, MySQL이 정상화되면 Flyway migration을 적용하고 JPA 스키마를 검증한다.
+서비스 포트는 MySQL `3306`, Redis `6379`, Kafka `29092`, Kafka UI `8080`이다. Kafka UI 포트는 `127.0.0.1`에만
+바인딩하므로 로컬 브라우저에서만 접속할 수 있다. 애플리케이션은 기본값으로 호스트의 세 인프라 서비스에 연결하며,
+MySQL이 정상화되면 Flyway migration을 적용하고 JPA 스키마를 검증한다.
 
 ```shell
 .\gradlew.bat bootRun
@@ -42,6 +43,38 @@ docker compose ps
 | `REDIS_PORT` | `6379` | Redis 포트 |
 | `KAFKA_PORT` | `29092` | Compose가 호스트에 공개하는 Kafka 포트 |
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:29092` | Kafka bootstrap 서버 |
+| `KAFKA_UI_PORT` | `8080` | Compose가 호스트에 공개하는 Kafka UI 포트 |
+
+Kafka UI 컨테이너는 다음 환경 변수로 Compose 네트워크 안의 Kafka broker에 연결한다. `localhost:29092`가 아닌
+`kafka:9092`를 사용해야 컨테이너 간 통신이 가능하다.
+
+| Kafka UI 환경 변수 | 값 | 용도 |
+| --- | --- | --- |
+| `KAFKA_CLUSTERS_0_NAME` | `local` | UI에 표시할 Kafka cluster 이름 |
+| `KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS` | `kafka:9092` | Compose 네트워크 내부 Kafka bootstrap 서버 |
+
+### Kafka UI 관찰과 장애 진단
+
+Compose를 기동한 뒤 [Kafka UI](http://localhost:8080)에 접속한다. 화면에서 `local` cluster가 정상으로 표시되어야 한다.
+`order.completed` 토픽과 `popular-menu` Consumer Group은 애플리케이션을 기동한 뒤 생성되므로, 정상 주문을 한 건 이상
+완료한 후 다음 순서로 확인한다.
+
+1. **토픽과 메시지**: `Topics`에서 `order.completed`를 열고 `Messages` 탭에서 주문 완료 이벤트를 조회한다. 각 메시지의
+   key는 주문 ID 문자열이며, value에는 주문 완료 이벤트가 표시된다. 메시지 상세 또는 목록의 partition 값을 기록한다.
+2. **3개 파티션**: 같은 토픽의 `Overview` 또는 `Partitions` 탭에서 partition `0`, `1`, `2`가 모두 있는지 확인한다.
+   이미 다른 파티션 수로 생성된 토픽은 자동으로 줄어들지 않는다. 로컬 데이터를 초기화해도 되는 경우에만
+   `docker compose down -v` 후 다시 기동한다.
+3. **Consumer Group offset과 lag**: `Consumer Groups`에서 `popular-menu`를 열어 Consumer 구성과 각 partition의
+   current offset, log end offset, lag를 확인한다. 정상 처리 완료 상태에서는 partition별 lag가 `0`이다.
+
+Redis 처리 실패는 Kafka UI에서 lag 증가를 가장 직접적으로 확인할 수 있는 방법이다. Redis를 중단한 뒤 주문을 생성하면
+`popular-menu` Consumer가 offset을 커밋하지 못해 log end offset은 증가하고 lag가 남는다. `docker compose start redis`로
+Redis를 복구한 뒤 같은 Consumer Group 화면에서 offset이 진행되고 모든 partition의 lag가 `0`이 되는지 확인한다.
+
+Kafka broker 장애는 UI 연결 상태와 Outbox 복구를 함께 확인한다. 장애 주입 전 Consumer Group의 offset과 lag를 기록하고
+`docker compose stop kafka`로 broker를 중단한다. 이때 Kafka UI는 cluster 연결 불가 상태가 되고, 애플리케이션의 새 주문은
+`PENDING` Outbox로 남을 수 있다. `docker compose start kafka`로 복구한 뒤 UI에서 `local` cluster가 정상으로 돌아온 것을
+확인하고 `order.completed` 메시지와 `popular-menu`의 offset·lag를 다시 확인한다. 재게시와 소비가 끝나면 lag는 `0`이어야 한다.
 
 `docker compose down -v`는 로컬 데이터 볼륨까지 삭제하므로 migration을 처음부터 다시 적용할 때만
 사용한다. MySQL, Redis 또는 Kafka 연결이 준비되지 않으면 기동 명령의 실패 원인을 확인하고 인프라를
