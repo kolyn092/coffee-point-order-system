@@ -35,3 +35,7 @@ out/
 
 ### VS Code ###
 .vscode/
+
+### Load test results ###
+docs/load-test/results/*
+!docs/load-test/results/.gitkeep
