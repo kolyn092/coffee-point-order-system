@@ -26,12 +26,14 @@ declare -a RUN_PASSES=()
 declare -a RUN_RPS=()
 declare -a RUN_P95=()
 declare -a RUN_P99=()
-declare -a RUN_CONSUMPTION_COMPLETION_SECONDS=()
-declare -a RUN_CONSUMPTION_THROUGHPUT=()
+declare -a RUN_END_TO_END_COMPLETION_SECONDS=()
+declare -a RUN_POST_LOAD_LAG_ZERO_SECONDS=()
+declare -a RUN_END_TO_END_THROUGHPUT=()
 declare -a SCALING_CONSUMER_COUNTS=()
-declare -a SCALING_MEDIAN_COMPLETION_SECONDS=()
-declare -a SCALING_MEDIAN_THROUGHPUT=()
-declare -a SCALING_MAX_THROUGHPUT=()
+declare -a SCALING_MEDIAN_END_TO_END_COMPLETION_SECONDS=()
+declare -a SCALING_MEDIAN_POST_LOAD_LAG_ZERO_SECONDS=()
+declare -a SCALING_MEDIAN_END_TO_END_THROUGHPUT=()
+declare -a SCALING_MAX_END_TO_END_THROUGHPUT=()
 declare -a SCALING_PASSES=()
 declare -a ENVIRONMENT_SERVICES=(mysql redis kafka app-1 app-2 load-balancer k6)
 declare -A ENVIRONMENT_IMAGE_REFERENCES=()
@@ -830,8 +832,9 @@ write_run_report() {
     local consumer_count="${14}"
     local consumer_group_id="${15}"
     local consumer_assignment="${16}"
-    local consumption_completion_seconds="${17}"
-    local consumption_throughput="${18}"
+    local post_load_lag_zero_seconds="${17}"
+    local end_to_end_completion_seconds="${18}"
+    local end_to_end_throughput="${19}"
     local report_path="$output_path/report.md"
     local index status service_name data_preparation active_consumer_count assigned_partition_count
     local execution_command
@@ -910,9 +913,9 @@ EOF
 
 ## Consumer Group 확장 결과
 
-| 설정 Consumer 수 | 활성 Consumer 수 | 할당 파티션 수 | lag 0 도달 시간(초) | 주문당 처리량(건/초) |
-| ---: | ---: | ---: | ---: | ---: |
-| $consumer_count | $active_consumer_count | $assigned_partition_count | $consumption_completion_seconds | $consumption_throughput |
+| 설정 Consumer 수 | 활성 Consumer 수 | 할당 파티션 수 | k6 종료 후 lag 0 도달 시간(초) | 종단간 완료 시간(초) | 종단간 처리량(건/초) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| $consumer_count | $active_consumer_count | $assigned_partition_count | $post_load_lag_zero_seconds | $end_to_end_completion_seconds | $end_to_end_throughput |
 
 | Consumer | 할당 파티션 |
 | --- | --- |
@@ -925,7 +928,8 @@ EOF
 
 Group ID는 `$consumer_group_id`이다. `order.completed`는 3개 파티션이므로 같은 Group에서 동시에 파티션을
 할당받는 Consumer도 최대 3개다. 4개 이상으로 확장하면 추가 Consumer는 유휴 상태가 되며, 이 구현은 병렬도 상한을
-3으로 제한한다.
+3으로 제한한다. 종단간 지표에는 HTTP 요청과 Outbox 발행 시간이 포함되고, k6 종료 후 lag 0 도달 시간은 Consumer가
+부하 종료 뒤 처리한 잔여 시간을 나타낸다.
 EOF
     fi
 
@@ -1019,16 +1023,18 @@ write_consumer_scaling_aggregate_report() {
 `order.completed`의 3개 파티션을 사용하며, `app-2` listener를 비활성화해 표의 Consumer 수를 Group 전체 활성
 Consumer 수로 맞췄다.
 
-| 설정 Consumer 수 | lag 0 도달 시간 중앙값(초) | 처리량 중앙값(건/초) | 처리량 최댓값(건/초) | 판정 |
-| ---: | ---: | ---: | ---: | --- |
+| 설정 Consumer 수 | k6 종료 후 lag 0 도달 시간 중앙값(초) | 종단간 완료 시간 중앙값(초) | 종단간 처리량 중앙값(건/초) | 종단간 처리량 최댓값(건/초) | 판정 |
+| ---: | ---: | ---: | ---: | ---: | --- |
 EOF
     for index in "${!SCALING_CONSUMER_COUNTS[@]}"; do
         status='실패'
         if [[ ${SCALING_PASSES[$index]} == true ]]; then
             status='통과'
         fi
-        echo "| ${SCALING_CONSUMER_COUNTS[$index]} | ${SCALING_MEDIAN_COMPLETION_SECONDS[$index]} |" \
-            "${SCALING_MEDIAN_THROUGHPUT[$index]} | ${SCALING_MAX_THROUGHPUT[$index]} | $status |" >>"$report_path"
+        echo "| ${SCALING_CONSUMER_COUNTS[$index]} | ${SCALING_MEDIAN_POST_LOAD_LAG_ZERO_SECONDS[$index]} |" \
+            "${SCALING_MEDIAN_END_TO_END_COMPLETION_SECONDS[$index]} |" \
+            "${SCALING_MEDIAN_END_TO_END_THROUGHPUT[$index]} |" \
+            "${SCALING_MAX_END_TO_END_THROUGHPUT[$index]} | $status |" >>"$report_path"
     done
 
     cat >>"$report_path" <<EOF
@@ -1047,7 +1053,8 @@ run_scenario() {
     local consumer_count="${5:-0}"
     local script_name user_environment=()
     local last_order_id last_outbox_event_id run_id output_path observation_path started_at started_epoch
-    local summary_path metrics_path k6_exit_code recovered requests requests_per_second p50 p95 p99 failed_rate
+    local summary_path metrics_path k6_exit_code k6_completed_epoch recovery_completed_epoch recovered
+    local requests requests_per_second p50 p95 p99 failed_rate
     local successful_orders actual_order_count actual_outbox_count published_outbox_count
     local initial_failures retry_failures recovery_deadline_epoch recovery_detail
     local expected_popular_menus fault_window_popular_responses fault_window_popular_violations
@@ -1057,7 +1064,9 @@ run_scenario() {
     local consumer_assignment='{}'
     local observation_consumer_count='null'
     local order_completed_partitions
-    local consumption_completion_seconds=0 consumption_throughput=0
+    local end_to_end_completion_seconds=0
+    local post_load_lag_zero_seconds=0
+    local end_to_end_throughput=0
 
     reset_load_test_data
     if [[ "$scenario_name" == redis-* ]]; then
@@ -1152,6 +1161,7 @@ run_scenario() {
         k6_exit_code=$?
     fi
     K6_PID=''
+    k6_completed_epoch=$(date +%s)
     restore_faulted_service "$scenario_name"
 
     [[ $k6_exit_code -eq 0 ]] || fail "k6 실행이 실패했습니다. 로그: $output_path/k6.log"
@@ -1166,8 +1176,10 @@ run_scenario() {
     else
         recovered=false
     fi
+    recovery_completed_epoch=$(date +%s)
     if (( consumer_count > 0 )); then
-        consumption_completion_seconds=$(( $(date +%s) - started_epoch ))
+        end_to_end_completion_seconds=$(( recovery_completed_epoch - started_epoch ))
+        post_load_lag_zero_seconds=$(( recovery_completed_epoch - k6_completed_epoch ))
     fi
     if [[ "$scenario_name" == 'kafka-recovery' ]]; then
         load_kafka_fault_maxima "$observation_path"
@@ -1183,8 +1195,8 @@ run_scenario() {
     p99=$(summary_value "$summary_path" '.metrics.http_req_duration.values["p(99)"]')
     failed_rate=$(summary_value "$summary_path" '.metrics.http_req_failed.values.rate')
     successful_orders=$(summary_value "$summary_path" '.metrics.successful_orders.values.count')
-    if (( consumer_count > 0 && consumption_completion_seconds > 0 )); then
-        consumption_throughput=$(awk -v orders="$successful_orders" -v seconds="$consumption_completion_seconds" \
+    if (( consumer_count > 0 && end_to_end_completion_seconds > 0 )); then
+        end_to_end_throughput=$(awk -v orders="$successful_orders" -v seconds="$end_to_end_completion_seconds" \
             'BEGIN { printf "%.2f", orders / seconds }')
         consumer_assignment=$(consumer_assignment_json "$consumer_group_id")
     fi
@@ -1358,7 +1370,8 @@ ORDER BY user_id;
     write_run_report "$output_path" "$run_id" "$scenario_name" "$commit" "$k6_version" \
         "$requests" "$requests_per_second" "$p50" "$p95" "$p99" "$failed_rate" \
         "$summary_hash" "$metrics_hash" "$consumer_count" "$consumer_group_id" \
-        "$consumer_assignment" "$consumption_completion_seconds" "$consumption_throughput"
+        "$consumer_assignment" "$post_load_lag_zero_seconds" "$end_to_end_completion_seconds" \
+        "$end_to_end_throughput"
 
     for expected_count in "${VALIDATION_PASSES[@]}"; do
         if [[ "$expected_count" != true ]]; then
@@ -1373,8 +1386,9 @@ ORDER BY user_id;
     RUN_RPS+=("$requests_per_second")
     RUN_P95+=("$p95")
     RUN_P99+=("$p99")
-    RUN_CONSUMPTION_COMPLETION_SECONDS+=("$consumption_completion_seconds")
-    RUN_CONSUMPTION_THROUGHPUT+=("$consumption_throughput")
+    RUN_END_TO_END_COMPLETION_SECONDS+=("$end_to_end_completion_seconds")
+    RUN_POST_LOAD_LAG_ZERO_SECONDS+=("$post_load_lag_zero_seconds")
+    RUN_END_TO_END_THROUGHPUT+=("$end_to_end_throughput")
 }
 
 parse_arguments() {
@@ -1437,9 +1451,10 @@ main() {
     for scenario_name in "${scenarios[@]}"; do
         if [[ "$scenario_name" == 'consumer-scaling' ]]; then
             SCALING_CONSUMER_COUNTS=()
-            SCALING_MEDIAN_COMPLETION_SECONDS=()
-            SCALING_MEDIAN_THROUGHPUT=()
-            SCALING_MAX_THROUGHPUT=()
+            SCALING_MEDIAN_END_TO_END_COMPLETION_SECONDS=()
+            SCALING_MEDIAN_POST_LOAD_LAG_ZERO_SECONDS=()
+            SCALING_MEDIAN_END_TO_END_THROUGHPUT=()
+            SCALING_MAX_END_TO_END_THROUGHPUT=()
             SCALING_PASSES=()
 
             local consumer_count scaling_pass
@@ -1449,8 +1464,9 @@ main() {
                 RUN_RPS=()
                 RUN_P95=()
                 RUN_P99=()
-                RUN_CONSUMPTION_COMPLETION_SECONDS=()
-                RUN_CONSUMPTION_THROUGHPUT=()
+                RUN_END_TO_END_COMPLETION_SECONDS=()
+                RUN_POST_LOAD_LAG_ZERO_SECONDS=()
+                RUN_END_TO_END_THROUGHPUT=()
                 for run_number in 1 2 3; do
                     run_scenario "$scenario_name" "$run_number" "$commit" "$k6_version" "$consumer_count"
                 done
@@ -1464,9 +1480,10 @@ main() {
                     fi
                 done
                 SCALING_CONSUMER_COUNTS+=("$consumer_count")
-                SCALING_MEDIAN_COMPLETION_SECONDS+=("$(median "${RUN_CONSUMPTION_COMPLETION_SECONDS[@]}")")
-                SCALING_MEDIAN_THROUGHPUT+=("$(median "${RUN_CONSUMPTION_THROUGHPUT[@]}")")
-                SCALING_MAX_THROUGHPUT+=("$(maximum "${RUN_CONSUMPTION_THROUGHPUT[@]}")")
+                SCALING_MEDIAN_END_TO_END_COMPLETION_SECONDS+=("$(median "${RUN_END_TO_END_COMPLETION_SECONDS[@]}")")
+                SCALING_MEDIAN_POST_LOAD_LAG_ZERO_SECONDS+=("$(median "${RUN_POST_LOAD_LAG_ZERO_SECONDS[@]}")")
+                SCALING_MEDIAN_END_TO_END_THROUGHPUT+=("$(median "${RUN_END_TO_END_THROUGHPUT[@]}")")
+                SCALING_MAX_END_TO_END_THROUGHPUT+=("$(maximum "${RUN_END_TO_END_THROUGHPUT[@]}")")
                 SCALING_PASSES+=("$scaling_pass")
             done
             write_consumer_scaling_aggregate_report "$batch_id"
@@ -1478,8 +1495,9 @@ main() {
         RUN_RPS=()
         RUN_P95=()
         RUN_P99=()
-        RUN_CONSUMPTION_COMPLETION_SECONDS=()
-        RUN_CONSUMPTION_THROUGHPUT=()
+        RUN_END_TO_END_COMPLETION_SECONDS=()
+        RUN_POST_LOAD_LAG_ZERO_SECONDS=()
+        RUN_END_TO_END_THROUGHPUT=()
         for run_number in 1 2 3; do
             run_scenario "$scenario_name" "$run_number" "$commit" "$k6_version"
         done
