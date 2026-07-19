@@ -1,10 +1,12 @@
 package com.coffeepointordersystem.infra.kafka;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
 
+import com.coffeepointordersystem.domain.menu.port.PopularMenuCache;
+import com.coffeepointordersystem.domain.order.event.OrderCompletedEvent;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -13,12 +15,29 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.ConsumerGroupDescription;
+import org.apache.kafka.clients.admin.MemberDescription;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
-import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.TopicExistsException;
+import org.apache.kafka.common.serialization.StringDeserializer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.boot.autoconfigure.AutoConfigurations;
+import org.springframework.boot.autoconfigure.context.ConfigurationPropertiesAutoConfiguration;
+import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
+import org.springframework.core.env.Environment;
+import org.springframework.kafka.annotation.EnableKafka;
+import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
+import org.springframework.kafka.listener.ConcurrentMessageListenerContainer;
+import org.springframework.kafka.listener.MessageListenerContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.kafka.KafkaContainer;
@@ -38,33 +57,51 @@ class KafkaConsumerGroupScalingIntegrationTest {
 		createOrderCompletedTopic();
 	}
 
-	@Test
-	void oneConsumer_receivesAllThreePartitions() throws Exception {
-		assertPartitionAssignment(1, 1);
+	@ParameterizedTest
+	@ValueSource(ints = {1, 2, 3})
+	void popularMenuListener_assignsAllPartitionsForConfiguredConcurrency(int concurrency) {
+		String groupId = "consumer-scaling-" + UUID.randomUUID();
+
+		createContextRunner(groupId, concurrency, true)
+				.run(context -> {
+					KafkaListenerEndpointRegistry registry = context.getBean(KafkaListenerEndpointRegistry.class);
+					MessageListenerContainer listenerContainer = registry.getListenerContainers().iterator().next();
+
+					assertThat(listenerContainer).isInstanceOf(ConcurrentMessageListenerContainer.class);
+					assertThat(((ConcurrentMessageListenerContainer<?, ?>) listenerContainer).getConcurrency())
+							.isEqualTo(concurrency);
+					assertPartitionAssignment(groupId, concurrency);
+				});
 	}
 
 	@Test
-	void twoConsumers_receiveAllThreePartitions() throws Exception {
-		assertPartitionAssignment(2, 2);
+	void popularMenuListener_doesNotStartWhenDisabled() {
+		String groupId = "consumer-scaling-" + UUID.randomUUID();
+
+		createContextRunner(groupId, 1, false)
+				.run(context -> {
+					KafkaListenerEndpointRegistry registry = context.getBean(KafkaListenerEndpointRegistry.class);
+					MessageListenerContainer listenerContainer = registry.getListenerContainers().iterator().next();
+
+					assertThat(listenerContainer.isRunning()).isFalse();
+				});
 	}
 
-	@Test
-	void threeConsumers_receiveOnePartitionEach() throws Exception {
-		assertPartitionAssignment(3, 3);
-	}
-
-	@Test
-	void fourConsumers_leaveOneConsumerIdleBecauseTheTopicHasThreePartitions() throws Exception {
-		assertPartitionAssignment(4, OrderCompletedKafkaTopicConfig.PARTITION_COUNT);
+	private ApplicationContextRunner createContextRunner(String groupId, int concurrency, boolean enabled) {
+		return new ApplicationContextRunner()
+				.withConfiguration(AutoConfigurations.of(ConfigurationPropertiesAutoConfiguration.class))
+				.withUserConfiguration(ListenerTestConfig.class)
+				.withPropertyValues(
+						"spring.kafka.consumer.group-id=" + groupId,
+						"popular-menu.consumer.concurrency=" + concurrency,
+						"popular-menu.consumer.enabled=" + enabled
+				);
 	}
 
 	private void createOrderCompletedTopic() throws Exception {
 		OrderCompletedKafkaTopicConfig config = new OrderCompletedKafkaTopicConfig();
 
-		try (AdminClient adminClient = AdminClient.create(Map.of(
-				AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG,
-				KAFKA.getBootstrapServers()
-		))) {
+		try (AdminClient adminClient = createAdminClient()) {
 			try {
 				adminClient.createTopics(List.of(config.orderCompletedTopic())).all().get(10L, TimeUnit.SECONDS);
 			} catch (ExecutionException exception) {
@@ -83,78 +120,75 @@ class KafkaConsumerGroupScalingIntegrationTest {
 		}
 	}
 
-	private void assertPartitionAssignment(int consumerCount, int expectedActiveConsumerCount) throws Exception {
-		List<KafkaConsumer<String, String>> consumers = createConsumers(consumerCount);
+	private void assertPartitionAssignment(String groupId, int expectedActiveConsumerCount) {
+		Instant deadline = Instant.now().plus(ASSIGNMENT_TIMEOUT);
+		Exception lastException = null;
 
-		try {
-			List<Set<TopicPartition>> assignments = awaitAssignments(consumers, expectedActiveConsumerCount);
-			long activeConsumerCount = assignments.stream().filter(assignment -> !assignment.isEmpty()).count();
-			Set<TopicPartition> assignedPartitions = assignments.stream()
-					.flatMap(Set::stream)
-					.collect(java.util.stream.Collectors.toSet());
+		while (Instant.now().isBefore(deadline)) {
+			try (AdminClient adminClient = createAdminClient()) {
+				ConsumerGroupDescription description = adminClient.describeConsumerGroups(List.of(groupId))
+						.all()
+						.get(1L, TimeUnit.SECONDS)
+						.get(groupId);
+				List<MemberDescription> members = List.copyOf(description.members());
+				Set<TopicPartition> assignedPartitions = members.stream()
+						.flatMap(member -> member.assignment().topicPartitions().stream())
+						.filter(topicPartition -> topicPartition.topic()
+								.equals(OrderCompletedKafkaTopicConfig.ORDER_COMPLETED_TOPIC))
+						.collect(java.util.stream.Collectors.toSet());
+				long activeConsumerCount = members.stream()
+						.filter(member -> member.assignment().topicPartitions().stream()
+								.anyMatch(topicPartition -> topicPartition.topic()
+										.equals(OrderCompletedKafkaTopicConfig.ORDER_COMPLETED_TOPIC)))
+						.count();
 
-			assertThat(activeConsumerCount).isEqualTo(expectedActiveConsumerCount);
-			assertThat(assignedPartitions)
-					.containsExactlyInAnyOrder(
-							new TopicPartition(OrderCompletedKafkaTopicConfig.ORDER_COMPLETED_TOPIC, 0),
-							new TopicPartition(OrderCompletedKafkaTopicConfig.ORDER_COMPLETED_TOPIC, 1),
-							new TopicPartition(OrderCompletedKafkaTopicConfig.ORDER_COMPLETED_TOPIC, 2)
-					);
-		} finally {
-			for (KafkaConsumer<String, String> consumer : consumers) {
-				consumer.close();
+				if (activeConsumerCount == expectedActiveConsumerCount
+						&& assignedPartitions.size() == OrderCompletedKafkaTopicConfig.PARTITION_COUNT) {
+					return;
+				}
+			} catch (Exception exception) {
+				lastException = exception;
 			}
+
+			Thread.onSpinWait();
 		}
+
+		throw new IllegalStateException("Kafka Consumer Group partition assignment did not complete in time.", lastException);
 	}
 
-	private List<KafkaConsumer<String, String>> createConsumers(int consumerCount) {
-		String groupId = "consumer-scaling-" + UUID.randomUUID();
-		List<KafkaConsumer<String, String>> consumers = new ArrayList<>();
+	private AdminClient createAdminClient() {
+		return AdminClient.create(Map.of(
+				AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG,
+				KAFKA.getBootstrapServers()
+		));
+	}
 
-		for (int index = 0; index < consumerCount; index++) {
-			KafkaConsumer<String, String> consumer = new KafkaConsumer<>(Map.of(
+	@Configuration(proxyBeanMethods = false)
+	@EnableKafka
+	@Import({PopularMenuKafkaConsumerConfig.class, PopularMenuKafkaConsumer.class})
+	static class ListenerTestConfig {
+
+		@Bean
+		ConsumerFactory<String, OrderCompletedEvent> consumerFactory(Environment environment) {
+			return new DefaultKafkaConsumerFactory<>(Map.of(
 					ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG,
 					KAFKA.getBootstrapServers(),
 					ConsumerConfig.GROUP_ID_CONFIG,
-					groupId,
+					environment.getRequiredProperty("spring.kafka.consumer.group-id"),
 					ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG,
-					"org.apache.kafka.common.serialization.StringDeserializer",
+					StringDeserializer.class,
 					ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG,
-					"org.apache.kafka.common.serialization.StringDeserializer",
+					StringDeserializer.class,
 					ConsumerConfig.AUTO_OFFSET_RESET_CONFIG,
-					"latest",
-					ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG,
-					false
+					"latest"
 			));
-			consumer.subscribe(List.of(OrderCompletedKafkaTopicConfig.ORDER_COMPLETED_TOPIC));
-			consumers.add(consumer);
 		}
 
-		return consumers;
-	}
-
-	private List<Set<TopicPartition>> awaitAssignments(
-			List<KafkaConsumer<String, String>> consumers,
-			int expectedActiveConsumerCount
-	) {
-		Instant deadline = Instant.now().plus(ASSIGNMENT_TIMEOUT);
-		while (Instant.now().isBefore(deadline)) {
-			for (KafkaConsumer<String, String> consumer : consumers) {
-				consumer.poll(Duration.ofMillis(100L));
-			}
-
-			List<Set<TopicPartition>> assignments = consumers.stream()
-					.map(KafkaConsumer::assignment)
-					.toList();
-			int assignedPartitionCount = assignments.stream().mapToInt(Set::size).sum();
-			long activeConsumerCount = assignments.stream().filter(assignment -> !assignment.isEmpty()).count();
-			if (assignedPartitionCount == OrderCompletedKafkaTopicConfig.PARTITION_COUNT
-					&& activeConsumerCount == expectedActiveConsumerCount) {
-				return assignments;
-			}
+		@Bean
+		PopularMenuCache popularMenuCache() {
+			return mock(PopularMenuCache.class);
 		}
 
-		throw new IllegalStateException("Kafka Consumer Group partition assignment did not complete in time.");
 	}
 
 }
