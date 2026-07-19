@@ -242,7 +242,9 @@ API 요청·응답과 오류는 `docs/API.md`, 데이터 모델과 DB 제약은 
   `report.md`는 원본 JSON의 파일명과 SHA-256도 포함해 결과를 재현 가능하게 연결한다.
 - 부하 테스트 구현은 k6 스크립트, 2개 애플리케이션·로드밸런서 Compose 구성, 5초 관측 수집과 결과 생성 자동화를
   사용한다. Consumer Group 확장 결과는 Consumer 수별 보고서와 중앙 비교 보고서로 남긴다. 대시보드와 알림은 이
-  단계에 추가하지 않는다.
+  단계에 추가하지 않는다. 단, 개발용 `docker-compose.yml`에는 `order.completed` 토픽과 `popular-menu` Consumer
+  Group을 수동으로 진단하기 위한 Kafka UI를 추가할 수 있다. Kafka UI는 `127.0.0.1`에만 바인딩하고, 부하 테스트
+  Compose·운영 배포·인증·인가·알림·애플리케이션 이벤트 계약에는 포함하지 않는다.
 
 ### 다중 서버
 
