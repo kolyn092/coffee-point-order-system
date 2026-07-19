@@ -395,15 +395,25 @@ add_observation() {
     local observation_path="$1"
     local log_since="$2"
     local consumer_group_id="${3:-popular-menu}"
-    local pending kafka_lag containers log_counts
+    local configured_consumer_count="${4:-null}"
+    local pending
+    local kafka_lag
+    local consumer_assignment
+    local containers
+    local log_counts
 
     pending=$(pending_snapshot_json)
     kafka_lag=$(kafka_lag_snapshot_json "$consumer_group_id")
+    consumer_assignment=$(consumer_assignment_json "$consumer_group_id")
     containers=$(container_stats_json)
     log_counts=$(application_log_counts_json "$log_since")
     jq -cn --arg timestampUtc "$(utc_now)" --argjson pending "$pending" --argjson kafkaLag "$kafka_lag" \
+        --argjson consumerAssignment "$consumer_assignment" \
+        --argjson configuredConsumerCount "$configured_consumer_count" \
         --argjson containers "$containers" --argjson publishFailureLogs "$log_counts" \
-        '{timestampUtc: $timestampUtc, pending: $pending, kafkaLag: $kafkaLag, containers: $containers,
+        '{timestampUtc: $timestampUtc, pending: $pending, kafkaLag: $kafkaLag,
+          consumerAssignment: $consumerAssignment, configuredConsumerCount: $configuredConsumerCount,
+          containers: $containers,
           publishFailureLogs: $publishFailureLogs}' >>"$observation_path"
 }
 
@@ -823,12 +833,17 @@ write_run_report() {
     local consumption_throughput="${18}"
     local report_path="$output_path/report.md"
     local index status service_name data_preparation active_consumer_count assigned_partition_count
+    local execution_command
 
     if [[ "$scenario_name" == redis-* ]]; then
         data_preparation="전용 Compose의 load-* 포인트 계정을 $SEED_BALANCE point로 생성하고, 주문·Outbox를 비운 뒤"
         data_preparation+=' MySQL 원본 집계용 고정 주문과 Redis를 초기화함'
     else
         data_preparation="전용 Compose의 load-* 포인트 계정을 $SEED_BALANCE point로 생성하고, 주문·Outbox와 Redis를 초기화함"
+    fi
+    execution_command="bash ./scripts/load-test/invoke-load-test.sh --scenario $scenario_name"
+    if [[ "$scenario_name" == 'consumer-scaling' ]]; then
+        execution_command="CONSUMER_SCALING_ITERATIONS=$CONSUMER_SCALING_ITERATIONS $execution_command"
     fi
 
     cat >"$report_path" <<EOF
@@ -846,7 +861,7 @@ write_run_report() {
 | Docker Compose 버전 | $DOCKER_COMPOSE_VERSION |
 | 요청 주소 | $BASE_URL |
 | 데이터 준비 | $data_preparation |
-| 실행 명령 | \`./scripts/load-test/invoke-load-test.sh --scenario $scenario_name\` |
+| 실행 명령 | \`$execution_command\` |
 
 ## 컨테이너 이미지
 
@@ -1037,7 +1052,10 @@ run_scenario() {
     local expected_popular_menus fault_window_popular_responses fault_window_popular_violations
     local balance_matches=true order_amount_matches=true popular_matches=false passed=true user_id expected_balance
     local charge_amount order_amount expected_count expected_amount actual_balance summary_hash metrics_hash
-    local consumer_group_id='popular-menu' consumer_assignment='{}' order_completed_partitions
+    local consumer_group_id='popular-menu'
+    local consumer_assignment='{}'
+    local observation_consumer_count='null'
+    local order_completed_partitions
     local consumption_completion_seconds=0 consumption_throughput=0
 
     reset_load_test_data
@@ -1050,6 +1068,7 @@ run_scenario() {
     if (( consumer_count > 0 )); then
         run_id="$(utc_run_id)-$scenario_name-$consumer_count-consumers-$run_number"
         consumer_group_id="popular-menu-scaling-$run_id"
+        observation_consumer_count="$consumer_count"
     else
         run_id="$(utc_run_id)-$scenario_name-$run_number"
     fi
@@ -1114,7 +1133,7 @@ run_scenario() {
             -e "POPULAR_MENU_FAULT_START_EPOCH_SECONDS=$(( started_epoch + 60 ))"
         )
     fi
-    add_observation "$observation_path" "$started_at" "$consumer_group_id"
+    add_observation "$observation_path" "$started_at" "$consumer_group_id" "$observation_consumer_count"
     start_k6_run "$script_name" "$run_id" "$output_path" \
         -e K6_BASE_URL=http://load-balancer:8080 \
         -e ORDER_MENU_ID=1 \
@@ -1123,7 +1142,7 @@ run_scenario() {
 
     while kill -0 "$K6_PID" >/dev/null 2>&1; do
         inject_fault "$scenario_name" "$started_epoch"
-        add_observation "$observation_path" "$started_at" "$consumer_group_id"
+        add_observation "$observation_path" "$started_at" "$consumer_group_id" "$observation_consumer_count"
         sleep "$OBSERVATION_INTERVAL_SECONDS"
     done
     if wait "$K6_PID"; then
