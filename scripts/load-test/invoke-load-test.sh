@@ -789,10 +789,11 @@ wait_for_recovery() {
     local log_since="$2"
     local deadline_epoch="$3"
     local consumer_group_id="${4:-popular-menu}"
+    local configured_consumer_count="${5:-null}"
     local observation now remaining_seconds sleep_seconds
 
     while true; do
-        add_observation "$observation_path" "$log_since" "$consumer_group_id"
+        add_observation "$observation_path" "$log_since" "$consumer_group_id" "$configured_consumer_count"
         observation=$(tail -n 1 "$observation_path")
         if jq -e '.pending.count == 0 and .kafkaLag.totalLag == 0' <<<"$observation" >/dev/null; then
             RECOVERY_OBSERVED_AT=$(utc_now)
@@ -1159,7 +1160,8 @@ run_scenario() {
     if (( recovery_deadline_epoch == 0 )); then
         recovery_deadline_epoch=$(( $(date +%s) + RECOVERY_TIMEOUT_SECONDS ))
     fi
-    if wait_for_recovery "$observation_path" "$started_at" "$recovery_deadline_epoch" "$consumer_group_id"; then
+    if wait_for_recovery "$observation_path" "$started_at" "$recovery_deadline_epoch" "$consumer_group_id" \
+        "$observation_consumer_count"; then
         recovered=true
     else
         recovered=false
