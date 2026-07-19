@@ -54,6 +54,12 @@ fail() {
 }
 
 compose() {
+    if [[ "$OSTYPE" == msys* ]]; then
+        MSYS_NO_PATHCONV=1 docker compose --project-name "$COMPOSE_PROJECT_NAME" \
+            --file "$(cygpath -w "$COMPOSE_FILE")" "$@"
+        return
+    fi
+
     docker compose --project-name "$COMPOSE_PROJECT_NAME" --file "$COMPOSE_FILE" "$@"
 }
 
@@ -283,12 +289,14 @@ consumer_assignment_json() {
             continue
         fi
         assignment=${columns[5]}
-        if [[ "$assignment" != *'order.completed('* ]]; then
-            continue
-        fi
         consumer_id=${columns[1]}
-        partition_text=${assignment#*order.completed(}
-        partition_text=${partition_text%%)*}
+        if [[ "$assignment" == *'order.completed('* ]]; then
+            partition_text=${assignment#*order.completed(}
+            partition_text=${partition_text%%)*}
+        else
+            partition_text=${assignment#(}
+            partition_text=${partition_text%)}
+        fi
         if [[ -n "$partition_text" ]]; then
             IFS=',' read -r -a partitions <<<"$partition_text"
         fi
@@ -326,7 +334,8 @@ wait_for_consumer_assignment() {
         sleep 1
     done
 
-    fail "Consumer Group 파티션 할당이 2분 안에 완료되지 않았습니다: $consumer_group_id"
+    fail "Consumer Group 파티션 할당이 2분 안에 완료되지 않았습니다: $consumer_group_id" \
+        "마지막 관측=$assignment"
 }
 
 restart_consumer_group() {
@@ -360,8 +369,8 @@ container_stats_json() {
         [[ -n "$container_id" ]] || continue
         stat=$(docker stats --no-stream --format '{{json .}}' "$container_id" 2>/dev/null || true)
         [[ -n "$stat" ]] || continue
-        cpu=$(jq -r '.CPUPerc | sub("%$"; "")' <<<"$stat")
-        memory_percent=$(jq -r '.MemPerc | sub("%$"; "")' <<<"$stat")
+        cpu=$(jq -r 'try (.CPUPerc | sub("%$"; "") | tonumber) catch null' <<<"$stat")
+        memory_percent=$(jq -r 'try (.MemPerc | sub("%$"; "") | tonumber) catch null' <<<"$stat")
         memory_usage=$(jq -r '.MemUsage' <<<"$stat")
         items+=("$(jq -cn --arg container "$service" --argjson cpu "$cpu" \
             --argjson memory "$memory_percent" --arg memoryUsage "$memory_usage" \
@@ -376,8 +385,8 @@ application_log_counts_json() {
     local logs initial_failures retry_failures
 
     logs=$(compose logs --no-color --since "$since" app-1 app-2 2>&1 || true)
-    initial_failures=$(grep -cF '주문 완료 이벤트 발행에 실패했습니다.' <<<"$logs" || true)
-    retry_failures=$(grep -cF 'PENDING Outbox 이벤트 재시도에 실패했습니다.' <<<"$logs" || true)
+    initial_failures=$(printf '%s\n' "$logs" | grep -cF '주문 완료 이벤트 발행에 실패했습니다.' || true)
+    retry_failures=$(printf '%s\n' "$logs" | grep -cF 'PENDING Outbox 이벤트 재시도에 실패했습니다.' || true)
     jq -cn --argjson initial "$initial_failures" --argjson retry "$retry_failures" \
         '{initialPublishFailures: $initial, retryPublishFailures: $retry}'
 }
@@ -625,8 +634,16 @@ analyse_k6_metrics() {
 summary_value() {
     local summary_path="$1"
     local jq_path="$2"
+    local value fallback_jq_path
 
-    jq -r "$jq_path // 0" "$summary_path"
+    value=$(jq -r "$jq_path // empty" "$summary_path")
+    if [[ -n "$value" ]]; then
+        echo "$value"
+        return
+    fi
+
+    fallback_jq_path=${jq_path/.values/}
+    jq -r "$fallback_jq_path // 0" "$summary_path"
 }
 
 declare -A POST_RUN_ORDER_COUNTS=()
@@ -1385,6 +1402,7 @@ main() {
     local commit k6_version batch_id scenario_name run_number
     commit=$(git -C "$PROJECT_ROOT" rev-parse HEAD)
     start_load_test_environment
+    capture_environment_metadata
     k6_version=$(compose run --rm -T k6 version | tr '\n' ' ')
     batch_id=$(utc_run_id)
 
