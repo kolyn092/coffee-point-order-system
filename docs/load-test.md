@@ -58,7 +58,7 @@ bash ./scripts/load-test/invoke-load-test.sh --scenario consumer-scaling
 ```
 
 기본 주문 수는 `CONSUMER_SCALING_ITERATIONS=600`이다. 값을 바꿀 때는 한 번의 명령에서 모든 Consumer 수에 같은 값을
-적용해야 하며, 결과 보고서의 데이터 준비와 실행 명령을 함께 보관한다.
+적용해야 하며, 결과 보고서의 데이터 준비와 실제 `CONSUMER_SCALING_ITERATIONS` 값을 포함한 실행 명령을 함께 보관한다.
 
 애플리케이션은 `order.completed`를 새 환경에서 파티션 3개, 복제 계수 1로 생성한다. `popular-menu.consumer.concurrency`
 기본값은 1이고 상한은 3이다. 이미 생성된 Kafka 토픽의 파티션 수는 줄일 수 없으므로, 3개보다 많은 기존 토픽을 이
@@ -75,7 +75,8 @@ bash ./scripts/load-test/invoke-load-test.sh --scenario consumer-scaling
 - 각 컨테이너의 CPU·메모리 사용량
 - Outbox `PENDING` 개수와 가장 오래된 생성 시각
 - `popular-menu` consumer group의 partition별·합계 lag
-- Consumer Group 확장 실행의 설정 Consumer 수, 활성 Consumer 수와 Consumer별 파티션 할당
+- Consumer Group 확장 실행의 설정 Consumer 수, 활성 Consumer 수와 Consumer별 파티션 할당. 할당 조회가 실패하면
+  같은 관측의 오류 필드에 실패 원인을 남긴다.
 - 최초 게시와 재시도 게시 실패 로그 수
 
 k6 종료 뒤에는 요청 수, 초당 요청 수, `http_req_duration` p50·p95·p99, `http_req_failed`를 기록한다. 또한 다음을
