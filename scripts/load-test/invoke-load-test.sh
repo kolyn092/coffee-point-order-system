@@ -252,7 +252,8 @@ kafka_lag_snapshot_json() {
 
     local partitions_json
     partitions_json=$(printf '%s\n' "${partitions[@]:-}" | jq -cs '.')
-    jq -cn --arg groupId "$consumer_group_id" --argjson partitionLag "$partitions_json" --argjson totalLag "$total_lag" \
+    jq -cn --arg groupId "$consumer_group_id" --argjson partitionLag "$partitions_json" \
+        --argjson totalLag "$total_lag" \
         '{groupId: $groupId, partitionLag: $partitionLag, totalLag: $totalLag, error: ""}'
 }
 
@@ -913,9 +914,14 @@ EOF
 
 ## Consumer Group 확장 결과
 
-| 설정 Consumer 수 | 활성 Consumer 수 | 할당 파티션 수 | k6 종료 후 lag 0 도달 시간(초) | 종단간 완료 시간(초) | 종단간 처리량(건/초) |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| $consumer_count | $active_consumer_count | $assigned_partition_count | $post_load_lag_zero_seconds | $end_to_end_completion_seconds | $end_to_end_throughput |
+| 항목 | 값 |
+| --- | ---: |
+| 설정 Consumer 수 | $consumer_count |
+| 활성 Consumer 수 | $active_consumer_count |
+| 할당 파티션 수 | $assigned_partition_count |
+| 종료 후 lag 0 도달 시간(초) | $post_load_lag_zero_seconds |
+| 종단간 완료 시간(초) | $end_to_end_completion_seconds |
+| 종단간 처리량(건/초) | $end_to_end_throughput |
 
 | Consumer | 할당 파티션 |
 | --- | --- |
@@ -926,10 +932,10 @@ EOF
             <<<"$consumer_assignment")
         cat >>"$report_path" <<EOF
 
-Group ID는 `$consumer_group_id`이다. `order.completed`는 3개 파티션이므로 같은 Group에서 동시에 파티션을
-할당받는 Consumer도 최대 3개다. 4개 이상으로 확장하면 추가 Consumer는 유휴 상태가 되며, 이 구현은 병렬도 상한을
-3으로 제한한다. 종단간 지표에는 HTTP 요청과 Outbox 발행 시간이 포함되고, k6 종료 후 lag 0 도달 시간은 Consumer가
-부하 종료 뒤 처리한 잔여 시간을 나타낸다.
+Group ID는 `$consumer_group_id`이다. `order.completed`는 3개 파티션이므로 같은 Group에서 동시에
+파티션을 할당받는 Consumer도 최대 3개다. 4개 이상으로 확장하면 추가 Consumer는 유휴 상태가 되며,
+이 구현은 병렬도 상한을 3으로 제한한다. 종단간 지표에는 HTTP 요청과 Outbox 발행 시간이 포함되고,
+k6 종료 후 lag 0 도달 시간은 Consumer가 부하 종료 뒤 처리한 잔여 시간을 나타낸다.
 EOF
     fi
 
@@ -1023,7 +1029,7 @@ write_consumer_scaling_aggregate_report() {
 `order.completed`의 3개 파티션을 사용하며, `app-2` listener를 비활성화해 표의 Consumer 수를 Group 전체 활성
 Consumer 수로 맞췄다.
 
-| 설정 Consumer 수 | k6 종료 후 lag 0 도달 시간 중앙값(초) | 종단간 완료 시간 중앙값(초) | 종단간 처리량 중앙값(건/초) | 종단간 처리량 최댓값(건/초) | 판정 |
+| 설정 수 | 종료 후 lag 0 중앙(초) | 종단간 중앙(초) | 처리량 중앙(건/초) | 처리량 최대(건/초) | 판정 |
 | ---: | ---: | ---: | ---: | ---: | --- |
 EOF
     for index in "${!SCALING_CONSUMER_COUNTS[@]}"; do
@@ -1039,9 +1045,9 @@ EOF
 
     cat >>"$report_path" <<EOF
 
-각 실행 보고서에는 Consumer별 실제 파티션 할당과 partition별·합계 lag가 있다. Kafka는 같은 Group의 파티션 하나를
-한 Consumer에만 할당하므로 4개 이상으로 확장하면 최대 3개만 활성이고 나머지는 유휴 상태가 된다. 이 구현은 3개
-파티션을 상한으로 병렬도를 제한한다.
+각 실행 보고서에는 Consumer별 실제 파티션 할당과 partition별·합계 lag가 있다. Kafka는 같은 Group의
+파티션 하나를 한 Consumer에만 할당하므로 4개 이상으로 확장하면 최대 3개만 활성이고 나머지는 유휴 상태가
+된다. 이 구현은 3개 파티션을 상한으로 병렬도를 제한한다.
 EOF
 }
 
@@ -1261,7 +1267,8 @@ WHERE id > $last_outbox_event_id
             and .assignedPartitionCount == 3
         ' <<<"$consumer_assignment" >/dev/null; then
             add_validation 'Consumer 수와 파티션 할당 상한' true \
-                "configured=$consumer_count, active=$(jq -r '.activeConsumerCount' <<<"$consumer_assignment"), assigned=3"
+                "configured=$consumer_count, active=$(jq -r '.activeConsumerCount' \
+                    <<<"$consumer_assignment"), assigned=3"
         else
             add_validation 'Consumer 수와 파티션 할당 상한' false \
                 "configured=$consumer_count, assignment=$(jq -c . <<<"$consumer_assignment")"
