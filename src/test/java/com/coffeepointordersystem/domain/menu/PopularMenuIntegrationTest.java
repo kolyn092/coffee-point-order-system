@@ -14,6 +14,7 @@ import com.coffeepointordersystem.domain.menu.exception.PopularMenuUnavailableEx
 import com.coffeepointordersystem.domain.menu.port.PopularMenuCache;
 import com.coffeepointordersystem.domain.menu.port.PopularMenuRecordingResult;
 import com.coffeepointordersystem.domain.order.event.OrderCompletedEvent;
+import com.coffeepointordersystem.infra.kafka.OrderCompletedKafkaTopicConfig;
 import com.coffeepointordersystem.infra.kafka.PopularMenuKafkaConsumer;
 import com.coffeepointordersystem.infra.redis.RedisPopularMenuCache;
 import java.time.Clock;
@@ -424,7 +425,11 @@ class PopularMenuIntegrationTest {
 				KAFKA.getBootstrapServers()
 		))) {
 			try {
-				adminClient.createTopics(List.of(new NewTopic(ORDER_COMPLETED_TOPIC, 1, (short) 1)))
+				adminClient.createTopics(List.of(new NewTopic(
+						ORDER_COMPLETED_TOPIC,
+						OrderCompletedKafkaTopicConfig.PARTITION_COUNT,
+						(short) 1
+				)))
 						.all()
 						.get(10L, TimeUnit.SECONDS);
 			} catch (ExecutionException exception) {

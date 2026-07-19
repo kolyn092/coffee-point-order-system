@@ -32,9 +32,9 @@ spring:
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:29092}
     admin:
-      auto-create: false
+      auto-create: true
     consumer:
-      group-id: popular-menu
+      group-id: ${POPULAR_MENU_CONSUMER_GROUP_ID:popular-menu}
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
       properties:
@@ -47,6 +47,11 @@ spring:
         max.block.ms: ${OUTBOX_RETRY_PUBLISH_TIMEOUT_MILLIS:5000}
   jackson:
     time-zone: UTC
+
+popular-menu:
+  consumer:
+    concurrency: ${POPULAR_MENU_CONSUMER_CONCURRENCY:1}
+    enabled: ${POPULAR_MENU_CONSUMER_ENABLED:true}
 
 outbox:
   retry:

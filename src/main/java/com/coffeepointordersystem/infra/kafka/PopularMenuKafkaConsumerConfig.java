@@ -2,6 +2,7 @@ package com.coffeepointordersystem.infra.kafka;
 
 import com.coffeepointordersystem.domain.order.event.OrderCompletedEvent;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
@@ -11,6 +12,7 @@ import org.springframework.kafka.listener.DefaultErrorHandler;
 import org.springframework.util.backoff.FixedBackOff;
 
 @Configuration
+@EnableConfigurationProperties(PopularMenuKafkaConsumerProperties.class)
 public class PopularMenuKafkaConsumerConfig {
 
 	private static final long RETRY_INTERVAL_MILLIS = 1_000L;
@@ -18,7 +20,8 @@ public class PopularMenuKafkaConsumerConfig {
 	@Bean
 	public ConcurrentKafkaListenerContainerFactory<String, OrderCompletedEvent>
 			popularMenuKafkaListenerContainerFactory(
-					ConsumerFactory<String, OrderCompletedEvent> consumerFactory
+					ConsumerFactory<String, OrderCompletedEvent> consumerFactory,
+					PopularMenuKafkaConsumerProperties properties
 			) {
 		ConcurrentKafkaListenerContainerFactory<String, OrderCompletedEvent> factory =
 				new ConcurrentKafkaListenerContainerFactory<>();
@@ -27,6 +30,7 @@ public class PopularMenuKafkaConsumerConfig {
 		factory.getContainerProperties()
 				.getKafkaConsumerProperties()
 				.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
+		factory.setConcurrency(properties.getConcurrency());
 		factory.setCommonErrorHandler(new DefaultErrorHandler(
 				new FixedBackOff(RETRY_INTERVAL_MILLIS, FixedBackOff.UNLIMITED_ATTEMPTS)
 		));

@@ -13,6 +13,7 @@ readonly BASE_URL="http://localhost:${LOAD_TEST_HTTP_PORT:-18080}"
 readonly SEED_BALANCE=10000000
 readonly OBSERVATION_INTERVAL_SECONDS=5
 readonly RECOVERY_TIMEOUT_SECONDS=300
+readonly CONSUMER_SCALING_ITERATIONS="${CONSUMER_SCALING_ITERATIONS:-600}"
 
 SCENARIO='all'
 KEEP_ENVIRONMENT=false
@@ -25,6 +26,15 @@ declare -a RUN_PASSES=()
 declare -a RUN_RPS=()
 declare -a RUN_P95=()
 declare -a RUN_P99=()
+declare -a RUN_END_TO_END_COMPLETION_SECONDS=()
+declare -a RUN_POST_LOAD_LAG_ZERO_SECONDS=()
+declare -a RUN_END_TO_END_THROUGHPUT=()
+declare -a SCALING_CONSUMER_COUNTS=()
+declare -a SCALING_MEDIAN_END_TO_END_COMPLETION_SECONDS=()
+declare -a SCALING_MEDIAN_POST_LOAD_LAG_ZERO_SECONDS=()
+declare -a SCALING_MEDIAN_END_TO_END_THROUGHPUT=()
+declare -a SCALING_MAX_END_TO_END_THROUGHPUT=()
+declare -a SCALING_PASSES=()
 declare -a ENVIRONMENT_SERVICES=(mysql redis kafka app-1 app-2 load-balancer k6)
 declare -A ENVIRONMENT_IMAGE_REFERENCES=()
 declare -A ENVIRONMENT_IMAGE_IDS=()
@@ -36,7 +46,7 @@ usage() {
     cat <<'EOF'
 사용법: ./scripts/load-test/invoke-load-test.sh [--scenario <name>] [--keep-environment]
 
-시나리오: all, mixed, contention, redis-connection, redis-data-loss, kafka-recovery
+시나리오: all, mixed, contention, redis-connection, redis-data-loss, kafka-recovery, consumer-scaling
 EOF
 }
 
@@ -46,6 +56,12 @@ fail() {
 }
 
 compose() {
+    if [[ "$OSTYPE" == msys* ]]; then
+        MSYS_NO_PATHCONV=1 docker compose --project-name "$COMPOSE_PROJECT_NAME" \
+            --file "$(cygpath -w "$COMPOSE_FILE")" "$@"
+        return
+    fi
+
     docker compose --project-name "$COMPOSE_PROJECT_NAME" --file "$COMPOSE_FILE" "$@"
 }
 
@@ -154,6 +170,9 @@ DELETE FROM point_accounts WHERE user_id LIKE 'load-%';
     for number in $(seq 1 10); do
         values+=("('load-kafka-$number', $SEED_BALANCE)")
     done
+    for number in $(seq 1 30); do
+        values+=("('load-scaling-$number', $SEED_BALANCE)")
+    done
     values+=("('load-contention', $SEED_BALANCE)")
 
     local joined_values
@@ -206,12 +225,14 @@ WHERE status = 'PENDING';
 }
 
 kafka_lag_snapshot_json() {
+    local consumer_group_id="${1:-popular-menu}"
     local output line topic partition lag total_lag=0
     local partitions=()
 
     if ! output=$(compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
-        --bootstrap-server kafka:9092 --describe --group popular-menu 2>&1); then
-        jq -cn --arg error "$output" '{partitionLag: [], totalLag: null, error: $error}'
+        --bootstrap-server kafka:9092 --describe --group "$consumer_group_id" 2>&1); then
+        jq -cn --arg groupId "$consumer_group_id" --arg error "$output" \
+            '{groupId: $groupId, partitionLag: [], totalLag: null, error: $error}'
         return
     fi
 
@@ -231,8 +252,105 @@ kafka_lag_snapshot_json() {
 
     local partitions_json
     partitions_json=$(printf '%s\n' "${partitions[@]:-}" | jq -cs '.')
-    jq -cn --argjson partitionLag "$partitions_json" --argjson totalLag "$total_lag" \
-        '{partitionLag: $partitionLag, totalLag: $totalLag, error: ""}'
+    jq -cn --arg groupId "$consumer_group_id" --argjson partitionLag "$partitions_json" \
+        --argjson totalLag "$total_lag" \
+        '{groupId: $groupId, partitionLag: $partitionLag, totalLag: $totalLag, error: ""}'
+}
+
+order_completed_partition_count() {
+    local output partition_count
+
+    if ! output=$(compose exec -T kafka /opt/kafka/bin/kafka-topics.sh \
+        --bootstrap-server kafka:9092 --describe --topic order.completed 2>&1); then
+        echo '0'
+        return
+    fi
+    partition_count=$(sed -n 's/.*PartitionCount:\([0-9][0-9]*\).*/\1/p' <<<"$output" | head -n 1)
+    echo "${partition_count:-0}"
+}
+
+consumer_assignment_json() {
+    local consumer_group_id="$1"
+    local output line consumer_id assignment partition_text
+    local members=()
+    local active_consumer_count=0
+    local assigned_partition_count=0
+
+    if ! output=$(compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+        --bootstrap-server kafka:9092 --describe --group "$consumer_group_id" --members --verbose 2>&1); then
+        jq -cn --arg error "$output" \
+            '{members: [], activeConsumerCount: 0, assignedPartitionCount: 0, error: $error}'
+        return
+    fi
+
+    while IFS= read -r line; do
+        local columns=()
+        local partitions=()
+
+        read -r -a columns <<<"$line"
+        if [[ ${#columns[@]} -lt 6 || ${columns[0]} == 'GROUP' ]]; then
+            continue
+        fi
+        assignment=${columns[5]}
+        consumer_id=${columns[1]}
+        if [[ "$assignment" == *'order.completed('* ]]; then
+            partition_text=${assignment#*order.completed(}
+            partition_text=${partition_text%%)*}
+        else
+            partition_text=${assignment#(}
+            partition_text=${partition_text%)}
+        fi
+        if [[ -n "$partition_text" ]]; then
+            IFS=',' read -r -a partitions <<<"$partition_text"
+        fi
+
+        members+=("$(printf '%s\n' "${partitions[@]}" | jq -Rsc 'split("\n") | map(select(length > 0) | tonumber)' \
+            | jq -c --arg consumerId "$consumer_id" '{consumerId: $consumerId, partitions: .}')")
+        active_consumer_count=$(( active_consumer_count + 1 ))
+        assigned_partition_count=$(( assigned_partition_count + ${#partitions[@]} ))
+    done <<<"$output"
+
+    local members_json
+    members_json=$(printf '%s\n' "${members[@]:-}" | jq -cs '.')
+    jq -cn --argjson members "$members_json" --argjson activeConsumerCount "$active_consumer_count" \
+        --argjson assignedPartitionCount "$assigned_partition_count" \
+        '{members: $members, activeConsumerCount: $activeConsumerCount,
+          assignedPartitionCount: $assignedPartitionCount, error: ""}'
+}
+
+wait_for_consumer_assignment() {
+    local consumer_group_id="$1"
+    local expected_consumer_count="$2"
+    local deadline_epoch=$(( $(date +%s) + 120 ))
+    local assignment
+
+    while (( $(date +%s) < deadline_epoch )); do
+        assignment=$(consumer_assignment_json "$consumer_group_id")
+        if jq -e --argjson expected "$expected_consumer_count" '
+            .error == ""
+            and .activeConsumerCount == $expected
+            and .assignedPartitionCount == 3
+        ' <<<"$assignment" >/dev/null; then
+            echo "$assignment"
+            return
+        fi
+        sleep 1
+    done
+
+    fail "Consumer Group 파티션 할당이 2분 안에 완료되지 않았습니다: $consumer_group_id" \
+        "마지막 관측=$assignment"
+}
+
+restart_consumer_group() {
+    local consumer_group_id="$1"
+    local consumer_count="$2"
+
+    LOAD_TEST_APP_1_CONSUMER_CONCURRENCY="$consumer_count" \
+    LOAD_TEST_APP_1_CONSUMER_ENABLED=true \
+    LOAD_TEST_APP_2_CONSUMER_CONCURRENCY=1 \
+    LOAD_TEST_APP_2_CONSUMER_ENABLED=false \
+    LOAD_TEST_CONSUMER_GROUP_ID="$consumer_group_id" \
+    compose up --force-recreate --no-deps --detach app-1 app-2
 }
 
 container_stats_json() {
@@ -254,8 +372,8 @@ container_stats_json() {
         [[ -n "$container_id" ]] || continue
         stat=$(docker stats --no-stream --format '{{json .}}' "$container_id" 2>/dev/null || true)
         [[ -n "$stat" ]] || continue
-        cpu=$(jq -r '.CPUPerc | sub("%$"; "")' <<<"$stat")
-        memory_percent=$(jq -r '.MemPerc | sub("%$"; "")' <<<"$stat")
+        cpu=$(jq -r 'try (.CPUPerc | sub("%$"; "") | tonumber) catch null' <<<"$stat")
+        memory_percent=$(jq -r 'try (.MemPerc | sub("%$"; "") | tonumber) catch null' <<<"$stat")
         memory_usage=$(jq -r '.MemUsage' <<<"$stat")
         items+=("$(jq -cn --arg container "$service" --argjson cpu "$cpu" \
             --argjson memory "$memory_percent" --arg memoryUsage "$memory_usage" \
@@ -270,8 +388,8 @@ application_log_counts_json() {
     local logs initial_failures retry_failures
 
     logs=$(compose logs --no-color --since "$since" app-1 app-2 2>&1 || true)
-    initial_failures=$(grep -cF '주문 완료 이벤트 발행에 실패했습니다.' <<<"$logs" || true)
-    retry_failures=$(grep -cF 'PENDING Outbox 이벤트 재시도에 실패했습니다.' <<<"$logs" || true)
+    initial_failures=$(printf '%s\n' "$logs" | grep -cF '주문 완료 이벤트 발행에 실패했습니다.' || true)
+    retry_failures=$(printf '%s\n' "$logs" | grep -cF 'PENDING Outbox 이벤트 재시도에 실패했습니다.' || true)
     jq -cn --argjson initial "$initial_failures" --argjson retry "$retry_failures" \
         '{initialPublishFailures: $initial, retryPublishFailures: $retry}'
 }
@@ -279,15 +397,26 @@ application_log_counts_json() {
 add_observation() {
     local observation_path="$1"
     local log_since="$2"
-    local pending kafka_lag containers log_counts
+    local consumer_group_id="${3:-popular-menu}"
+    local configured_consumer_count="${4:-null}"
+    local pending
+    local kafka_lag
+    local consumer_assignment
+    local containers
+    local log_counts
 
     pending=$(pending_snapshot_json)
-    kafka_lag=$(kafka_lag_snapshot_json)
+    kafka_lag=$(kafka_lag_snapshot_json "$consumer_group_id")
+    consumer_assignment=$(consumer_assignment_json "$consumer_group_id")
     containers=$(container_stats_json)
     log_counts=$(application_log_counts_json "$log_since")
     jq -cn --arg timestampUtc "$(utc_now)" --argjson pending "$pending" --argjson kafkaLag "$kafka_lag" \
+        --argjson consumerAssignment "$consumer_assignment" \
+        --argjson configuredConsumerCount "$configured_consumer_count" \
         --argjson containers "$containers" --argjson publishFailureLogs "$log_counts" \
-        '{timestampUtc: $timestampUtc, pending: $pending, kafkaLag: $kafkaLag, containers: $containers,
+        '{timestampUtc: $timestampUtc, pending: $pending, kafkaLag: $kafkaLag,
+          consumerAssignment: $consumerAssignment, configuredConsumerCount: $configuredConsumerCount,
+          containers: $containers,
           publishFailureLogs: $publishFailureLogs}' >>"$observation_path"
 }
 
@@ -518,8 +647,16 @@ analyse_k6_metrics() {
 summary_value() {
     local summary_path="$1"
     local jq_path="$2"
+    local value fallback_jq_path
 
-    jq -r "$jq_path // 0" "$summary_path"
+    value=$(jq -r "$jq_path // empty" "$summary_path")
+    if [[ -n "$value" ]]; then
+        echo "$value"
+        return
+    fi
+
+    fallback_jq_path=${jq_path/.values/}
+    jq -r "$fallback_jq_path // 0" "$summary_path"
 }
 
 declare -A POST_RUN_ORDER_COUNTS=()
@@ -654,10 +791,12 @@ wait_for_recovery() {
     local observation_path="$1"
     local log_since="$2"
     local deadline_epoch="$3"
+    local consumer_group_id="${4:-popular-menu}"
+    local configured_consumer_count="${5:-null}"
     local observation now remaining_seconds sleep_seconds
 
     while true; do
-        add_observation "$observation_path" "$log_since"
+        add_observation "$observation_path" "$log_since" "$consumer_group_id" "$configured_consumer_count"
         observation=$(tail -n 1 "$observation_path")
         if jq -e '.pending.count == 0 and .kafkaLag.totalLag == 0' <<<"$observation" >/dev/null; then
             RECOVERY_OBSERVED_AT=$(utc_now)
@@ -691,14 +830,25 @@ write_run_report() {
     local failed_rate="${11}"
     local summary_hash="${12}"
     local metrics_hash="${13}"
+    local consumer_count="${14}"
+    local consumer_group_id="${15}"
+    local consumer_assignment="${16}"
+    local post_load_lag_zero_seconds="${17}"
+    local end_to_end_completion_seconds="${18}"
+    local end_to_end_throughput="${19}"
     local report_path="$output_path/report.md"
-    local index status service_name data_preparation
+    local index status service_name data_preparation active_consumer_count assigned_partition_count
+    local execution_command
 
     if [[ "$scenario_name" == redis-* ]]; then
         data_preparation="전용 Compose의 load-* 포인트 계정을 $SEED_BALANCE point로 생성하고, 주문·Outbox를 비운 뒤"
         data_preparation+=' MySQL 원본 집계용 고정 주문과 Redis를 초기화함'
     else
         data_preparation="전용 Compose의 load-* 포인트 계정을 $SEED_BALANCE point로 생성하고, 주문·Outbox와 Redis를 초기화함"
+    fi
+    execution_command="bash ./scripts/load-test/invoke-load-test.sh --scenario $scenario_name"
+    if [[ "$scenario_name" == 'consumer-scaling' ]]; then
+        execution_command="CONSUMER_SCALING_ITERATIONS=$CONSUMER_SCALING_ITERATIONS $execution_command"
     fi
 
     cat >"$report_path" <<EOF
@@ -716,7 +866,7 @@ write_run_report() {
 | Docker Compose 버전 | $DOCKER_COMPOSE_VERSION |
 | 요청 주소 | $BASE_URL |
 | 데이터 준비 | $data_preparation |
-| 실행 명령 | \`./scripts/load-test/invoke-load-test.sh --scenario $scenario_name\` |
+| 실행 명령 | \`$execution_command\` |
 
 ## 컨테이너 이미지
 
@@ -756,6 +906,40 @@ EOF
 | ten_vus | ${STAGE_RPS[ten_vus]} | ${STAGE_P95[ten_vus]} |
 | thirty_vus | ${STAGE_RPS[thirty_vus]} | ${STAGE_P95[thirty_vus]} |
 | sixty_vus | ${STAGE_RPS[sixty_vus]} | ${STAGE_P95[sixty_vus]} |
+EOF
+    if (( consumer_count > 0 )); then
+        active_consumer_count=$(jq -r '.activeConsumerCount' <<<"$consumer_assignment")
+        assigned_partition_count=$(jq -r '.assignedPartitionCount' <<<"$consumer_assignment")
+        cat >>"$report_path" <<EOF
+
+## Consumer Group 확장 결과
+
+| 항목 | 값 |
+| --- | ---: |
+| 설정 Consumer 수 | $consumer_count |
+| 활성 Consumer 수 | $active_consumer_count |
+| 할당 파티션 수 | $assigned_partition_count |
+| 종료 후 lag 0 도달 시간(초) | $post_load_lag_zero_seconds |
+| 종단간 완료 시간(초) | $end_to_end_completion_seconds |
+| 종단간 처리량(건/초) | $end_to_end_throughput |
+
+| Consumer | 할당 파티션 |
+| --- | --- |
+EOF
+        while IFS=$'\t' read -r consumer_id partitions; do
+            echo "| $consumer_id | $partitions |" >>"$report_path"
+        done < <(jq -r '.members[] | [.consumerId, (.partitions | map(tostring) | join(", "))] | @tsv' \
+            <<<"$consumer_assignment")
+        cat >>"$report_path" <<EOF
+
+Group ID는 `$consumer_group_id`이다. `order.completed`는 3개 파티션이므로 같은 Group에서 동시에
+파티션을 할당받는 Consumer도 최대 3개다. 4개 이상으로 확장하면 추가 Consumer는 유휴 상태가 되며,
+이 구현은 병렬도 상한을 3으로 제한한다. 종단간 지표에는 HTTP 요청과 Outbox 발행 시간이 포함되고,
+k6 종료 후 lag 0 도달 시간은 Consumer가 부하 종료 뒤 처리한 잔여 시간을 나타낸다.
+EOF
+    fi
+
+    cat >>"$report_path" <<EOF
 
 ## 정합성·복구 판정
 
@@ -833,19 +1017,62 @@ EOF
 EOF
 }
 
+write_consumer_scaling_aggregate_report() {
+    local batch_id="$1"
+    local report_path="$RESULTS_ROOT/$batch_id-consumer-scaling-comparison.md"
+    local index status
+
+    cat >"$report_path" <<EOF
+# Consumer Group 확장 비교 보고서
+
+같은 $CONSUMER_SCALING_ITERATIONS건 주문 부하를 Consumer 수 1·2·3에서 각각 세 번 실행한 결과다. 모든 실행은
+`order.completed`의 3개 파티션을 사용하며, `app-2` listener를 비활성화해 표의 Consumer 수를 Group 전체 활성
+Consumer 수로 맞췄다.
+
+| 설정 수 | 종료 후 lag 0 중앙(초) | 종단간 중앙(초) | 처리량 중앙(건/초) | 처리량 최대(건/초) | 판정 |
+| ---: | ---: | ---: | ---: | ---: | --- |
+EOF
+    for index in "${!SCALING_CONSUMER_COUNTS[@]}"; do
+        status='실패'
+        if [[ ${SCALING_PASSES[$index]} == true ]]; then
+            status='통과'
+        fi
+        echo "| ${SCALING_CONSUMER_COUNTS[$index]} | ${SCALING_MEDIAN_POST_LOAD_LAG_ZERO_SECONDS[$index]} |" \
+            "${SCALING_MEDIAN_END_TO_END_COMPLETION_SECONDS[$index]} |" \
+            "${SCALING_MEDIAN_END_TO_END_THROUGHPUT[$index]} |" \
+            "${SCALING_MAX_END_TO_END_THROUGHPUT[$index]} | $status |" >>"$report_path"
+    done
+
+    cat >>"$report_path" <<EOF
+
+각 실행 보고서에는 Consumer별 실제 파티션 할당과 partition별·합계 lag가 있다. Kafka는 같은 Group의
+파티션 하나를 한 Consumer에만 할당하므로 4개 이상으로 확장하면 최대 3개만 활성이고 나머지는 유휴 상태가
+된다. 이 구현은 3개 파티션을 상한으로 병렬도를 제한한다.
+EOF
+}
+
 run_scenario() {
     local scenario_name="$1"
     local run_number="$2"
     local commit="$3"
     local k6_version="$4"
+    local consumer_count="${5:-0}"
     local script_name user_environment=()
     local last_order_id last_outbox_event_id run_id output_path observation_path started_at started_epoch
-    local summary_path metrics_path k6_exit_code recovered requests requests_per_second p50 p95 p99 failed_rate
+    local summary_path metrics_path k6_exit_code k6_completed_epoch recovery_completed_epoch recovered
+    local requests requests_per_second p50 p95 p99 failed_rate
     local successful_orders actual_order_count actual_outbox_count published_outbox_count
     local initial_failures retry_failures recovery_deadline_epoch recovery_detail
     local expected_popular_menus fault_window_popular_responses fault_window_popular_violations
     local balance_matches=true order_amount_matches=true popular_matches=false passed=true user_id expected_balance
     local charge_amount order_amount expected_count expected_amount actual_balance summary_hash metrics_hash
+    local consumer_group_id='popular-menu'
+    local consumer_assignment='{}'
+    local observation_consumer_count='null'
+    local order_completed_partitions
+    local end_to_end_completion_seconds=0
+    local post_load_lag_zero_seconds=0
+    local end_to_end_throughput=0
 
     reset_load_test_data
     if [[ "$scenario_name" == redis-* ]]; then
@@ -854,7 +1081,13 @@ run_scenario() {
     load_baseline_balances
     last_order_id=$(mysql_scalar 'SELECT COALESCE(MAX(id), 0) FROM orders;')
     last_outbox_event_id=$(mysql_scalar 'SELECT COALESCE(MAX(id), 0) FROM outbox_events;')
-    run_id="$(utc_run_id)-$scenario_name-$run_number"
+    if (( consumer_count > 0 )); then
+        run_id="$(utc_run_id)-$scenario_name-$consumer_count-consumers-$run_number"
+        consumer_group_id="popular-menu-scaling-$run_id"
+        observation_consumer_count="$consumer_count"
+    else
+        run_id="$(utc_run_id)-$scenario_name-$run_number"
+    fi
     output_path="$RESULTS_ROOT/$run_id"
     observation_path="$output_path/observations.ndjson"
     mkdir -p "$output_path"
@@ -875,6 +1108,18 @@ run_scenario() {
             script_name='kafka-recovery.js'
             user_environment=(-e USER_PREFIX=load-kafka -e USER_COUNT=10)
             ;;
+        consumer-scaling)
+            (( consumer_count >= 1 && consumer_count <= 3 )) \
+                || fail 'Consumer Group 확장 실행의 Consumer 수는 1부터 3까지여야 합니다.'
+            script_name='consumer-scaling.js'
+            user_environment=(
+                -e USER_PREFIX=load-scaling
+                -e USER_COUNT=30
+                -e "CONSUMER_SCALING_ITERATIONS=$CONSUMER_SCALING_ITERATIONS"
+            )
+            restart_consumer_group "$consumer_group_id" "$consumer_count"
+            consumer_assignment=$(wait_for_consumer_assignment "$consumer_group_id" "$consumer_count")
+            ;;
         *)
             fail "알 수 없는 시나리오입니다: $scenario_name"
             ;;
@@ -894,6 +1139,7 @@ run_scenario() {
     VALIDATION_NAMES=()
     VALIDATION_PASSES=()
     VALIDATION_DETAILS=()
+    order_completed_partitions=$(order_completed_partition_count)
     started_at=$(utc_now)
     started_epoch=$(date +%s)
     if [[ "$scenario_name" == redis-* ]]; then
@@ -903,7 +1149,7 @@ run_scenario() {
             -e "POPULAR_MENU_FAULT_START_EPOCH_SECONDS=$(( started_epoch + 60 ))"
         )
     fi
-    add_observation "$observation_path" "$started_at"
+    add_observation "$observation_path" "$started_at" "$consumer_group_id" "$observation_consumer_count"
     start_k6_run "$script_name" "$run_id" "$output_path" \
         -e K6_BASE_URL=http://load-balancer:8080 \
         -e ORDER_MENU_ID=1 \
@@ -912,7 +1158,7 @@ run_scenario() {
 
     while kill -0 "$K6_PID" >/dev/null 2>&1; do
         inject_fault "$scenario_name" "$started_epoch"
-        add_observation "$observation_path" "$started_at"
+        add_observation "$observation_path" "$started_at" "$consumer_group_id" "$observation_consumer_count"
         sleep "$OBSERVATION_INTERVAL_SECONDS"
     done
     if wait "$K6_PID"; then
@@ -921,6 +1167,7 @@ run_scenario() {
         k6_exit_code=$?
     fi
     K6_PID=''
+    k6_completed_epoch=$(date +%s)
     restore_faulted_service "$scenario_name"
 
     [[ $k6_exit_code -eq 0 ]] || fail "k6 실행이 실패했습니다. 로그: $output_path/k6.log"
@@ -929,10 +1176,16 @@ run_scenario() {
     if (( recovery_deadline_epoch == 0 )); then
         recovery_deadline_epoch=$(( $(date +%s) + RECOVERY_TIMEOUT_SECONDS ))
     fi
-    if wait_for_recovery "$observation_path" "$started_at" "$recovery_deadline_epoch"; then
+    if wait_for_recovery "$observation_path" "$started_at" "$recovery_deadline_epoch" "$consumer_group_id" \
+        "$observation_consumer_count"; then
         recovered=true
     else
         recovered=false
+    fi
+    recovery_completed_epoch=$(date +%s)
+    if (( consumer_count > 0 )); then
+        end_to_end_completion_seconds=$(( recovery_completed_epoch - started_epoch ))
+        post_load_lag_zero_seconds=$(( recovery_completed_epoch - k6_completed_epoch ))
     fi
     if [[ "$scenario_name" == 'kafka-recovery' ]]; then
         load_kafka_fault_maxima "$observation_path"
@@ -948,6 +1201,11 @@ run_scenario() {
     p99=$(summary_value "$summary_path" '.metrics.http_req_duration.values["p(99)"]')
     failed_rate=$(summary_value "$summary_path" '.metrics.http_req_failed.values.rate')
     successful_orders=$(summary_value "$summary_path" '.metrics.successful_orders.values.count')
+    if (( consumer_count > 0 && end_to_end_completion_seconds > 0 )); then
+        end_to_end_throughput=$(awk -v orders="$successful_orders" -v seconds="$end_to_end_completion_seconds" \
+            'BEGIN { printf "%.2f", orders / seconds }')
+        consumer_assignment=$(consumer_assignment_json "$consumer_group_id")
+    fi
     fault_window_popular_responses=$(summary_value "$summary_path" \
         '.metrics.fault_window_popular_responses.values.count')
     fault_window_popular_violations=$(summary_value "$summary_path" \
@@ -996,6 +1254,26 @@ WHERE id > $last_outbox_event_id
         recovery_detail="기한 epoch=$recovery_deadline_epoch, 관측=$RECOVERY_OBSERVED_AT"
     fi
     add_validation 'PENDING과 consumer lag 기한 내 해소' "$recovered" "$recovery_detail"
+
+    if [[ "$scenario_name" == 'consumer-scaling' ]]; then
+        if [[ "$order_completed_partitions" == 3 ]]; then
+            add_validation 'order.completed 토픽 파티션 수' true "partitions=$order_completed_partitions"
+        else
+            add_validation 'order.completed 토픽 파티션 수' false "partitions=$order_completed_partitions"
+        fi
+        if jq -e --argjson expected "$consumer_count" '
+            .error == ""
+            and .activeConsumerCount == $expected
+            and .assignedPartitionCount == 3
+        ' <<<"$consumer_assignment" >/dev/null; then
+            add_validation 'Consumer 수와 파티션 할당 상한' true \
+                "configured=$consumer_count, active=$(jq -r '.activeConsumerCount' \
+                    <<<"$consumer_assignment"), assigned=3"
+        else
+            add_validation 'Consumer 수와 파티션 할당 상한' false \
+                "configured=$consumer_count, assignment=$(jq -c . <<<"$consumer_assignment")"
+        fi
+    fi
 
     while IFS=$'\t' read -r user_id actual_balance; do
         [[ -n "$user_id" ]] || continue
@@ -1098,7 +1376,9 @@ ORDER BY user_id;
     metrics_hash=$(sha256sum "$metrics_path" | awk '{print $1}')
     write_run_report "$output_path" "$run_id" "$scenario_name" "$commit" "$k6_version" \
         "$requests" "$requests_per_second" "$p50" "$p95" "$p99" "$failed_rate" \
-        "$summary_hash" "$metrics_hash"
+        "$summary_hash" "$metrics_hash" "$consumer_count" "$consumer_group_id" \
+        "$consumer_assignment" "$post_load_lag_zero_seconds" "$end_to_end_completion_seconds" \
+        "$end_to_end_throughput"
 
     for expected_count in "${VALIDATION_PASSES[@]}"; do
         if [[ "$expected_count" != true ]]; then
@@ -1113,6 +1393,9 @@ ORDER BY user_id;
     RUN_RPS+=("$requests_per_second")
     RUN_P95+=("$p95")
     RUN_P99+=("$p99")
+    RUN_END_TO_END_COMPLETION_SECONDS+=("$end_to_end_completion_seconds")
+    RUN_POST_LOAD_LAG_ZERO_SECONDS+=("$post_load_lag_zero_seconds")
+    RUN_END_TO_END_THROUGHPUT+=("$end_to_end_throughput")
 }
 
 parse_arguments() {
@@ -1138,7 +1421,7 @@ parse_arguments() {
     done
 
     case "$SCENARIO" in
-        all|mixed|contention|redis-connection|redis-data-loss|kafka-recovery)
+        all|mixed|contention|redis-connection|redis-data-loss|kafka-recovery|consumer-scaling)
             ;;
         *)
             fail "알 수 없는 시나리오입니다: $SCENARIO"
@@ -1154,27 +1437,74 @@ main() {
     require_command jq
     require_command sha256sum
     assert_dedicated_compose_file
+    [[ "$CONSUMER_SCALING_ITERATIONS" =~ ^[1-9][0-9]*$ ]] \
+        || fail 'CONSUMER_SCALING_ITERATIONS는 1 이상의 정수여야 합니다.'
     mkdir -p "$RESULTS_ROOT"
 
     local commit k6_version batch_id scenario_name run_number
     commit=$(git -C "$PROJECT_ROOT" rev-parse HEAD)
     start_load_test_environment
+    capture_environment_metadata
     k6_version=$(compose run --rm -T k6 version | tr '\n' ' ')
     batch_id=$(utc_run_id)
 
     local scenarios=()
     if [[ "$SCENARIO" == all ]]; then
-        scenarios=(mixed contention redis-connection redis-data-loss kafka-recovery)
+        scenarios=(mixed contention redis-connection redis-data-loss kafka-recovery consumer-scaling)
     else
         scenarios=("$SCENARIO")
     fi
 
     for scenario_name in "${scenarios[@]}"; do
+        if [[ "$scenario_name" == 'consumer-scaling' ]]; then
+            SCALING_CONSUMER_COUNTS=()
+            SCALING_MEDIAN_END_TO_END_COMPLETION_SECONDS=()
+            SCALING_MEDIAN_POST_LOAD_LAG_ZERO_SECONDS=()
+            SCALING_MEDIAN_END_TO_END_THROUGHPUT=()
+            SCALING_MAX_END_TO_END_THROUGHPUT=()
+            SCALING_PASSES=()
+
+            local consumer_count scaling_pass
+            for consumer_count in 1 2 3; do
+                RUN_IDS=()
+                RUN_PASSES=()
+                RUN_RPS=()
+                RUN_P95=()
+                RUN_P99=()
+                RUN_END_TO_END_COMPLETION_SECONDS=()
+                RUN_POST_LOAD_LAG_ZERO_SECONDS=()
+                RUN_END_TO_END_THROUGHPUT=()
+                for run_number in 1 2 3; do
+                    run_scenario "$scenario_name" "$run_number" "$commit" "$k6_version" "$consumer_count"
+                done
+                write_aggregate_report "$batch_id" "$scenario_name-$consumer_count-consumers"
+
+                scaling_pass=true
+                for status in "${RUN_PASSES[@]}"; do
+                    if [[ "$status" != true ]]; then
+                        scaling_pass=false
+                        break
+                    fi
+                done
+                SCALING_CONSUMER_COUNTS+=("$consumer_count")
+                SCALING_MEDIAN_END_TO_END_COMPLETION_SECONDS+=("$(median "${RUN_END_TO_END_COMPLETION_SECONDS[@]}")")
+                SCALING_MEDIAN_POST_LOAD_LAG_ZERO_SECONDS+=("$(median "${RUN_POST_LOAD_LAG_ZERO_SECONDS[@]}")")
+                SCALING_MEDIAN_END_TO_END_THROUGHPUT+=("$(median "${RUN_END_TO_END_THROUGHPUT[@]}")")
+                SCALING_MAX_END_TO_END_THROUGHPUT+=("$(maximum "${RUN_END_TO_END_THROUGHPUT[@]}")")
+                SCALING_PASSES+=("$scaling_pass")
+            done
+            write_consumer_scaling_aggregate_report "$batch_id"
+            continue
+        fi
+
         RUN_IDS=()
         RUN_PASSES=()
         RUN_RPS=()
         RUN_P95=()
         RUN_P99=()
+        RUN_END_TO_END_COMPLETION_SECONDS=()
+        RUN_POST_LOAD_LAG_ZERO_SECONDS=()
+        RUN_END_TO_END_THROUGHPUT=()
         for run_number in 1 2 3; do
             run_scenario "$scenario_name" "$run_number" "$commit" "$k6_version"
         done
