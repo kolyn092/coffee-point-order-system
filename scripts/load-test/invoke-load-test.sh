@@ -8,7 +8,7 @@ PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 readonly PROJECT_ROOT
 readonly COMPOSE_FILE="$PROJECT_ROOT/docker-compose.load-test.yml"
 readonly COMPOSE_PROJECT_NAME='coffee-point-order-load-test'
-readonly RESULTS_ROOT="$PROJECT_ROOT/docs/load-test/results"
+readonly RESULTS_ROOT="${LOAD_TEST_RESULTS_ROOT:-$PROJECT_ROOT/docs/load-test/results}"
 readonly BASE_URL="http://localhost:${LOAD_TEST_HTTP_PORT:-18080}"
 readonly SEED_BALANCE=10000000
 readonly OBSERVATION_INTERVAL_SECONDS=5
@@ -20,6 +20,7 @@ KEEP_ENVIRONMENT=false
 ENVIRONMENT_STARTED=false
 K6_PID=''
 ANY_FAILURE=false
+WORK_RESULTS_DIRECTORY=''
 
 declare -a RUN_IDS=()
 declare -a RUN_PASSES=()
@@ -149,6 +150,10 @@ cleanup() {
 
     if [[ "$KEEP_ENVIRONMENT" == false && "$ENVIRONMENT_STARTED" == true ]]; then
         stop_load_test_environment || true
+    fi
+
+    if [[ -n "$WORK_RESULTS_DIRECTORY" && -d "$WORK_RESULTS_DIRECTORY" ]]; then
+        rm -rf "$WORK_RESULTS_DIRECTORY"
     fi
 }
 
@@ -538,15 +543,19 @@ restore_faulted_service() {
 
 start_k6_run() {
     local script_name="$1"
-    local run_id="$2"
-    local output_path="$3"
-    shift 3
+    local output_path="$2"
+    local results_relative_path
+    shift 2
     local environment_arguments=("$@")
     local k6_log_path="$output_path/k6.log"
 
+    results_relative_path=${output_path#"$RESULTS_ROOT"/}
+    [[ "$results_relative_path" != "$output_path" ]] \
+        || fail "중간 결과 경로가 결과 루트 밖에 있습니다: $output_path"
+
     compose run --rm -T "${environment_arguments[@]}" k6 run \
-        "--summary-export=/results/$run_id/summary.json" \
-        "--out=json=/results/$run_id/metrics.json" \
+        "--summary-export=/results/$results_relative_path/summary.json" \
+        "--out=json=/results/$results_relative_path/metrics.json" \
         "/scripts/$script_name" >"$k6_log_path" 2>&1 &
     K6_PID=$!
 }
@@ -816,6 +825,19 @@ wait_for_recovery() {
     done
 }
 
+kafka_lag_measurements() {
+    local observation_path="$1"
+
+    jq -sr '
+        [.[] | .kafkaLag.totalLag | select(type == "number")] as $lags
+        | if ($lags | length) == 0 then
+              "0\\t0"
+          else
+              "\($lags | max)\\t\($lags | last)"
+          end
+    ' "$observation_path"
+}
+
 write_run_report() {
     local output_path="$1"
     local run_id="$2"
@@ -828,14 +850,15 @@ write_run_report() {
     local p95="$9"
     local p99="${10}"
     local failed_rate="${11}"
-    local summary_hash="${12}"
-    local metrics_hash="${13}"
-    local consumer_count="${14}"
-    local consumer_group_id="${15}"
-    local consumer_assignment="${16}"
-    local post_load_lag_zero_seconds="${17}"
-    local end_to_end_completion_seconds="${18}"
-    local end_to_end_throughput="${19}"
+    local completion_rate="${12}"
+    local consumer_count="${13}"
+    local consumer_group_id="${14}"
+    local consumer_assignment="${15}"
+    local maximum_kafka_lag="${16}"
+    local final_kafka_lag="${17}"
+    local post_load_lag_zero_seconds="${18}"
+    local end_to_end_completion_seconds="${19}"
+    local end_to_end_throughput="${20}"
     local report_path="$output_path/report.md"
     local index status service_name data_preparation active_consumer_count assigned_partition_count
     local execution_command
@@ -852,7 +875,7 @@ write_run_report() {
     fi
 
     cat >"$report_path" <<EOF
-# 부하 테스트 실행 보고서
+## 실행 결과: $run_id
 
 ## 실행 정보
 
@@ -893,11 +916,17 @@ EOF
 
     cat >>"$report_path" <<EOF
 
-## k6 원본 요약
+### k6 원본 측정값
 
-| 요청 수 | 초당 요청 수 | p50(ms) | p95(ms) | p99(ms) | http_req_failed |
+| 요청 수 | 완료율(%) | 초당 요청 수 | p50(ms) | p95(ms) | p99(ms) | http_req_failed |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| $requests | $requests_per_second | $p50 | $p95 | $p99 | $failed_rate |
+| $requests | $completion_rate | $requests_per_second | $p50 | $p95 | $p99 | $failed_rate |
+
+### Kafka lag 원본 측정값
+
+| 관측 최댓값 | 최종 관측값 | k6 종료 후 lag 0 도달 시간(초) |
+| ---: | ---: | ---: |
+| $maximum_kafka_lag | $final_kafka_lag | $post_load_lag_zero_seconds |
 
 ## 혼합 흐름 VU 단계 비교
 
@@ -919,6 +948,8 @@ EOF
 | 설정 Consumer 수 | $consumer_count |
 | 활성 Consumer 수 | $active_consumer_count |
 | 할당 파티션 수 | $assigned_partition_count |
+| 관측 최대 Kafka lag | $maximum_kafka_lag |
+| 최종 Kafka lag | $final_kafka_lag |
 | 종료 후 lag 0 도달 시간(초) | $post_load_lag_zero_seconds |
 | 종단간 완료 시간(초) | $end_to_end_completion_seconds |
 | 종단간 처리량(건/초) | $end_to_end_throughput |
@@ -932,8 +963,8 @@ EOF
             <<<"$consumer_assignment")
         cat >>"$report_path" <<EOF
 
-Group ID는 `$consumer_group_id`이다. `order.completed`는 3개 파티션이므로 같은 Group에서 동시에
-파티션을 할당받는 Consumer도 최대 3개다. 4개 이상으로 확장하면 추가 Consumer는 유휴 상태가 되며,
+Group ID는 \`$consumer_group_id\`이다. \`order.completed\`는 3개 파티션이다.
+같은 Group에서 동시에 파티션을 할당받는 Consumer도 최대 3개다. 4개 이상으로 확장하면 추가 Consumer는 유휴 상태가 되며,
 이 구현은 병렬도 상한을 3으로 제한한다. 종단간 지표에는 HTTP 요청과 Outbox 발행 시간이 포함되고,
 k6 종료 후 lag 0 도달 시간은 Consumer가 부하 종료 뒤 처리한 잔여 시간을 나타낸다.
 EOF
@@ -967,14 +998,8 @@ EOF
 
     cat >>"$report_path" <<EOF
 
-## 원본 파일 무결성
-
-| 파일 | SHA-256 |
-| --- | --- |
-| \`summary.json\` | \`$summary_hash\` |
-| \`metrics.json\` | \`$metrics_hash\` |
-
-\`observations.ndjson\`에는 컨테이너 CPU·메모리, \`PENDING\`, consumer group partition별·합계 lag와 게시 실패 로그 수를 5초마다 기록한다.
+\`observations.ndjson\`에는 컨테이너 CPU·메모리, \`PENDING\`, consumer group partition별·합계 lag와 게시 실패 로그 수를
+5초마다 기록했다. 이 중간 파일은 최종 보고서를 만든 뒤 정리한다.
 EOF
 }
 
@@ -989,11 +1014,14 @@ maximum() {
 write_aggregate_report() {
     local batch_id="$1"
     local scenario_name="$2"
-    local report_path="$RESULTS_ROOT/$batch_id-$scenario_name-aggregate.md"
-    local index status
+    local result_directory="$RESULTS_ROOT/$batch_id-$scenario_name"
+    local report_path="$result_directory/report.md"
+    local index status run_id
+
+    mkdir -p "$result_directory"
 
     cat >"$report_path" <<EOF
-# $scenario_name 3회 실행 집계
+# $scenario_name 부하 테스트 보고서
 
 | 실행 | 초당 요청 수 | p95(ms) | p99(ms) | 판정 |
 | --- | ---: | ---: | ---: | --- |
@@ -1015,18 +1043,31 @@ EOF
 | p95(ms) | $(median "${RUN_P95[@]}") | $(maximum "${RUN_P95[@]}") |
 | p99(ms) | $(median "${RUN_P99[@]}") | $(maximum "${RUN_P99[@]}") |
 EOF
+
+    cat >>"$report_path" <<EOF
+
+## 반복 실행별 원본 측정값 및 판정 근거
+
+EOF
+    for run_id in "${RUN_IDS[@]}"; do
+        cat "$WORK_RESULTS_DIRECTORY/$run_id/report.md" >>"$report_path"
+        printf '\n' >>"$report_path"
+    done
 }
 
 write_consumer_scaling_aggregate_report() {
     local batch_id="$1"
-    local report_path="$RESULTS_ROOT/$batch_id-consumer-scaling-comparison.md"
-    local index status
+    local result_directory="$RESULTS_ROOT/$batch_id-consumer-scaling"
+    local report_path="$result_directory/report.md"
+    local index status report_fragment
+
+    mkdir -p "$result_directory"
 
     cat >"$report_path" <<EOF
 # Consumer Group 확장 비교 보고서
 
 같은 $CONSUMER_SCALING_ITERATIONS건 주문 부하를 Consumer 수 1·2·3에서 각각 세 번 실행한 결과다. 모든 실행은
-`order.completed`의 3개 파티션을 사용하며, `app-2` listener를 비활성화해 표의 Consumer 수를 Group 전체 활성
+\`order.completed\`의 3개 파티션을 사용하며, \`app-2\` listener를 비활성화해 표의 Consumer 수를 Group 전체 활성
 Consumer 수로 맞췄다.
 
 | 설정 수 | 종료 후 lag 0 중앙(초) | 종단간 중앙(초) | 처리량 중앙(건/초) | 처리량 최대(건/초) | 판정 |
@@ -1045,10 +1086,22 @@ EOF
 
     cat >>"$report_path" <<EOF
 
-각 실행 보고서에는 Consumer별 실제 파티션 할당과 partition별·합계 lag가 있다. Kafka는 같은 Group의
+각 실행 결과에는 Consumer별 실제 파티션 할당과 최대·최종 Kafka lag, 완료율이 있다.
+정합성·복구 판정 근거도 함께 기록한다. Kafka는 같은 Group의
 파티션 하나를 한 Consumer에만 할당하므로 4개 이상으로 확장하면 최대 3개만 활성이고 나머지는 유휴 상태가
 된다. 이 구현은 3개 파티션을 상한으로 병렬도를 제한한다.
 EOF
+
+    cat >>"$report_path" <<EOF
+
+## 반복 실행별 원본 측정값 및 판정 근거
+
+EOF
+    for report_fragment in "$WORK_RESULTS_DIRECTORY"/*-consumer-scaling-*/report.md; do
+        [[ -f "$report_fragment" ]] || continue
+        cat "$report_fragment" >>"$report_path"
+        printf '\n' >>"$report_path"
+    done
 }
 
 run_scenario() {
@@ -1060,12 +1113,12 @@ run_scenario() {
     local script_name user_environment=()
     local last_order_id last_outbox_event_id run_id output_path observation_path started_at started_epoch
     local summary_path metrics_path k6_exit_code k6_completed_epoch recovery_completed_epoch recovered
-    local requests requests_per_second p50 p95 p99 failed_rate
+    local requests requests_per_second p50 p95 p99 failed_rate completion_rate
     local successful_orders actual_order_count actual_outbox_count published_outbox_count
     local initial_failures retry_failures recovery_deadline_epoch recovery_detail
     local expected_popular_menus fault_window_popular_responses fault_window_popular_violations
     local balance_matches=true order_amount_matches=true popular_matches=false passed=true user_id expected_balance
-    local charge_amount order_amount expected_count expected_amount actual_balance summary_hash metrics_hash
+    local charge_amount order_amount expected_count expected_amount actual_balance
     local consumer_group_id='popular-menu'
     local consumer_assignment='{}'
     local observation_consumer_count='null'
@@ -1073,6 +1126,8 @@ run_scenario() {
     local end_to_end_completion_seconds=0
     local post_load_lag_zero_seconds=0
     local end_to_end_throughput=0
+    local maximum_kafka_lag=0
+    local final_kafka_lag=0
 
     reset_load_test_data
     if [[ "$scenario_name" == redis-* ]]; then
@@ -1088,7 +1143,7 @@ run_scenario() {
     else
         run_id="$(utc_run_id)-$scenario_name-$run_number"
     fi
-    output_path="$RESULTS_ROOT/$run_id"
+    output_path="$WORK_RESULTS_DIRECTORY/$run_id"
     observation_path="$output_path/observations.ndjson"
     mkdir -p "$output_path"
 
@@ -1150,7 +1205,7 @@ run_scenario() {
         )
     fi
     add_observation "$observation_path" "$started_at" "$consumer_group_id" "$observation_consumer_count"
-    start_k6_run "$script_name" "$run_id" "$output_path" \
+    start_k6_run "$script_name" "$output_path" \
         -e K6_BASE_URL=http://load-balancer:8080 \
         -e ORDER_MENU_ID=1 \
         -e POINT_CHARGE_AMOUNT=5000 \
@@ -1190,6 +1245,7 @@ run_scenario() {
     if [[ "$scenario_name" == 'kafka-recovery' ]]; then
         load_kafka_fault_maxima "$observation_path"
     fi
+    IFS=$'\t' read -r maximum_kafka_lag final_kafka_lag < <(kafka_lag_measurements "$observation_path")
 
     summary_path="$output_path/summary.json"
     metrics_path="$output_path/metrics.json"
@@ -1200,6 +1256,7 @@ run_scenario() {
     p95=$(summary_value "$summary_path" '.metrics.http_req_duration.values["p(95)"]')
     p99=$(summary_value "$summary_path" '.metrics.http_req_duration.values["p(99)"]')
     failed_rate=$(summary_value "$summary_path" '.metrics.http_req_failed.values.rate')
+    completion_rate=$(awk -v failed="$failed_rate" 'BEGIN { printf "%.2f", (1 - failed) * 100 }')
     successful_orders=$(summary_value "$summary_path" '.metrics.successful_orders.values.count')
     if (( consumer_count > 0 && end_to_end_completion_seconds > 0 )); then
         end_to_end_throughput=$(awk -v orders="$successful_orders" -v seconds="$end_to_end_completion_seconds" \
@@ -1372,13 +1429,10 @@ ORDER BY user_id;
     fi
 
     add_bottleneck_candidates "$observation_path"
-    summary_hash=$(sha256sum "$summary_path" | awk '{print $1}')
-    metrics_hash=$(sha256sum "$metrics_path" | awk '{print $1}')
     write_run_report "$output_path" "$run_id" "$scenario_name" "$commit" "$k6_version" \
-        "$requests" "$requests_per_second" "$p50" "$p95" "$p99" "$failed_rate" \
-        "$summary_hash" "$metrics_hash" "$consumer_count" "$consumer_group_id" \
-        "$consumer_assignment" "$post_load_lag_zero_seconds" "$end_to_end_completion_seconds" \
-        "$end_to_end_throughput"
+        "$requests" "$requests_per_second" "$p50" "$p95" "$p99" "$failed_rate" "$completion_rate" \
+        "$consumer_count" "$consumer_group_id" "$consumer_assignment" "$maximum_kafka_lag" "$final_kafka_lag" \
+        "$post_load_lag_zero_seconds" "$end_to_end_completion_seconds" "$end_to_end_throughput"
 
     for expected_count in "${VALIDATION_PASSES[@]}"; do
         if [[ "$expected_count" != true ]]; then
@@ -1435,7 +1489,6 @@ main() {
     require_command curl
     require_command git
     require_command jq
-    require_command sha256sum
     assert_dedicated_compose_file
     [[ "$CONSUMER_SCALING_ITERATIONS" =~ ^[1-9][0-9]*$ ]] \
         || fail 'CONSUMER_SCALING_ITERATIONS는 1 이상의 정수여야 합니다.'
@@ -1447,6 +1500,8 @@ main() {
     capture_environment_metadata
     k6_version=$(compose run --rm -T k6 version | tr '\n' ' ')
     batch_id=$(utc_run_id)
+    WORK_RESULTS_DIRECTORY="$RESULTS_ROOT/.work-$batch_id"
+    mkdir -p "$WORK_RESULTS_DIRECTORY"
 
     local scenarios=()
     if [[ "$SCENARIO" == all ]]; then
@@ -1477,8 +1532,6 @@ main() {
                 for run_number in 1 2 3; do
                     run_scenario "$scenario_name" "$run_number" "$commit" "$k6_version" "$consumer_count"
                 done
-                write_aggregate_report "$batch_id" "$scenario_name-$consumer_count-consumers"
-
                 scaling_pass=true
                 for status in "${RUN_PASSES[@]}"; do
                     if [[ "$status" != true ]]; then
@@ -1514,5 +1567,7 @@ main() {
     [[ "$ANY_FAILURE" == false ]] || fail "부하 테스트 판정 실패가 있습니다. 결과 경로: $RESULTS_ROOT"
 }
 
-trap cleanup EXIT
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    trap cleanup EXIT
+    main "$@"
+fi
