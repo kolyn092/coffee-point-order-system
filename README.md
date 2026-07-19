@@ -55,7 +55,8 @@ Kafka UI 컨테이너는 다음 환경 변수로 Compose 네트워크 안의 Kaf
 
 ### Kafka UI 관찰과 장애 진단
 
-Compose를 기동한 뒤 [Kafka UI](http://localhost:8080)에 접속한다. 화면에서 `local` cluster가 정상으로 표시되어야 한다.
+Compose를 기동한 뒤 기본 포트인 [Kafka UI](http://localhost:8080)에 접속한다. `KAFKA_UI_PORT`를 설정했다면
+`http://localhost:<설정한 포트>`로 접속한다. 화면에서 `local` cluster가 정상으로 표시되어야 한다.
 `order.completed` 토픽과 `popular-menu` Consumer Group은 애플리케이션을 기동한 뒤 생성되므로, 정상 주문을 한 건 이상
 완료한 후 다음 순서로 확인한다.
 
