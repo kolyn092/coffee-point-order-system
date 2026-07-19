@@ -25,6 +25,12 @@ declare -a RUN_PASSES=()
 declare -a RUN_RPS=()
 declare -a RUN_P95=()
 declare -a RUN_P99=()
+declare -a ENVIRONMENT_SERVICES=(mysql redis kafka app-1 app-2 load-balancer k6)
+declare -A ENVIRONMENT_IMAGE_REFERENCES=()
+declare -A ENVIRONMENT_IMAGE_IDS=()
+
+DOCKER_ENGINE_VERSION=''
+DOCKER_COMPOSE_VERSION=''
 
 usage() {
     cat <<'EOF'
@@ -41,6 +47,27 @@ fail() {
 
 compose() {
     docker compose --project-name "$COMPOSE_PROJECT_NAME" --file "$COMPOSE_FILE" "$@"
+}
+
+capture_service_image_metadata() {
+    local service_name="$1"
+    local container_id
+
+    container_id=$(compose ps --all --quiet "$service_name")
+    [[ -n "$container_id" ]] || fail "이미지 정보를 찾을 수 없는 서비스입니다: $service_name"
+    ENVIRONMENT_IMAGE_REFERENCES["$service_name"]=$(docker inspect --format '{{.Config.Image}}' "$container_id")
+    ENVIRONMENT_IMAGE_IDS["$service_name"]=$(docker inspect --format '{{.Image}}' "$container_id")
+}
+
+capture_environment_metadata() {
+    local service_name
+
+    DOCKER_ENGINE_VERSION=$(docker version --format '{{.Server.Version}}')
+    DOCKER_COMPOSE_VERSION=$(docker compose version --short)
+    compose create k6 >/dev/null
+    for service_name in "${ENVIRONMENT_SERVICES[@]}"; do
+        capture_service_image_metadata "$service_name"
+    done
 }
 
 mysql_query() {
@@ -133,6 +160,18 @@ DELETE FROM point_accounts WHERE user_id LIKE 'load-%';
     joined_values=$(IFS=,; echo "${values[*]}")
     mysql_query "INSERT INTO point_accounts (user_id, balance) VALUES $joined_values;" >/dev/null
     compose exec -T redis redis-cli FLUSHALL >/dev/null
+}
+
+seed_redis_popular_menu_data() {
+    mysql_query "
+INSERT INTO orders (user_id, menu_id, paid_amount, ordered_at)
+VALUES
+    ('load-redis-1', 1, 4500, UTC_TIMESTAMP(6)),
+    ('load-redis-2', 1, 4500, UTC_TIMESTAMP(6)),
+    ('load-redis-3', 1, 4500, UTC_TIMESTAMP(6)),
+    ('load-redis-4', 2, 5000, UTC_TIMESTAMP(6)),
+    ('load-redis-5', 2, 5000, UTC_TIMESTAMP(6));
+" >/dev/null
 }
 
 declare -A BASELINE_BALANCES=()
@@ -255,10 +294,57 @@ add_observation() {
 declare -A FAULT_STATE=([stopped]=false [restored]=false [injected]=false)
 declare -a FAULT_EVENTS=()
 
+FAULT_RECOVERY_AT=''
+RECOVERY_DEADLINE_EPOCH=0
+RECOVERY_OBSERVED_AT=''
+KAFKA_FAULT_STARTED_AT=''
+KAFKA_BASELINE_CAPTURED=false
+KAFKA_BASELINE_PENDING=0
+KAFKA_BASELINE_LAG=0
+KAFKA_MAX_PENDING=0
+KAFKA_MAX_LAG=0
+
 add_fault_event() {
     local action="$1"
+    local occurred_at="${2:-$(utc_now)}"
 
-    FAULT_EVENTS+=("$(utc_now)|$action")
+    FAULT_EVENTS+=("$occurred_at|$action")
+}
+
+record_fault_recovery() {
+    FAULT_RECOVERY_AT=$(utc_now)
+    RECOVERY_DEADLINE_EPOCH=$(( $(date +%s) + RECOVERY_TIMEOUT_SECONDS ))
+}
+
+capture_kafka_fault_baseline() {
+    local pending kafka_lag
+
+    KAFKA_FAULT_STARTED_AT=$(utc_now)
+    pending=$(pending_snapshot_json)
+    kafka_lag=$(kafka_lag_snapshot_json)
+    KAFKA_BASELINE_PENDING=$(jq -r '.count' <<<"$pending")
+    if jq -e '.totalLag | type == "number"' <<<"$kafka_lag" >/dev/null; then
+        KAFKA_BASELINE_LAG=$(jq -r '.totalLag' <<<"$kafka_lag")
+        KAFKA_BASELINE_CAPTURED=true
+        return
+    fi
+
+    KAFKA_BASELINE_LAG=0
+    KAFKA_BASELINE_CAPTURED=false
+}
+
+load_kafka_fault_maxima() {
+    local observation_path="$1"
+
+    KAFKA_MAX_PENDING=0
+    KAFKA_MAX_LAG=0
+    [[ -n "$KAFKA_FAULT_STARTED_AT" ]] || return
+    KAFKA_MAX_PENDING=$(jq -s --arg from "$KAFKA_FAULT_STARTED_AT" '
+        [.[] | select(.timestampUtc >= $from) | .pending.count] | max // 0
+    ' "$observation_path")
+    KAFKA_MAX_LAG=$(jq -s --arg from "$KAFKA_FAULT_STARTED_AT" '
+        [.[] | select(.timestampUtc >= $from) | .kafkaLag.totalLag | select(type == "number")] | max // 0
+    ' "$observation_path")
 }
 
 inject_fault() {
@@ -274,8 +360,9 @@ inject_fault() {
         fi
         if [[ ${FAULT_STATE[stopped]} == true && ${FAULT_STATE[restored]} == false && $elapsed -ge 120 ]]; then
             compose start redis >/dev/null
+            record_fault_recovery
             FAULT_STATE[restored]=true
-            add_fault_event 'Redis 복구'
+            add_fault_event 'Redis 복구' "$FAULT_RECOVERY_AT"
         fi
     fi
 
@@ -287,14 +374,16 @@ inject_fault() {
 
     if [[ "$scenario_name" == 'kafka-recovery' ]]; then
         if [[ ${FAULT_STATE[stopped]} == false && $elapsed -ge 60 ]]; then
+            capture_kafka_fault_baseline
             compose stop kafka >/dev/null
             FAULT_STATE[stopped]=true
             add_fault_event 'Kafka broker 중단'
         fi
         if [[ ${FAULT_STATE[stopped]} == true && ${FAULT_STATE[restored]} == false && $elapsed -ge 120 ]]; then
             compose start kafka >/dev/null
+            record_fault_recovery
             FAULT_STATE[restored]=true
-            add_fault_event 'Kafka broker 복구'
+            add_fault_event 'Kafka broker 복구' "$FAULT_RECOVERY_AT"
         fi
     fi
 }
@@ -308,8 +397,12 @@ restore_faulted_service() {
 
     if [[ "$scenario_name" == redis-* ]]; then
         compose start redis >/dev/null
+        record_fault_recovery
+        add_fault_event 'Redis 복구(k6 종료 후)' "$FAULT_RECOVERY_AT"
     else
         compose start kafka >/dev/null
+        record_fault_recovery
+        add_fault_event 'Kafka broker 복구(k6 종료 후)' "$FAULT_RECOVERY_AT"
     fi
     FAULT_STATE[restored]=true
 }
@@ -465,15 +558,8 @@ add_validation() {
     VALIDATION_DETAILS+=("$details")
 }
 
-popular_menus_match_mysql() {
-    local output_path="$1"
-    local api_path="$output_path/popular-menu-api.json"
-    local status expected_json
-
-    status=$(curl --silent --show-error --max-time 10 --output "$api_path" --write-out '%{http_code}' \
-        "$BASE_URL/api/v1/menus/popular" || true)
-    [[ "$status" == '200' ]] || return 1
-    expected_json=$(mysql_scalar "
+popular_menu_expected_json() {
+    mysql_scalar "
 SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT(
     'menuId', ranked.menu_id,
     'name', ranked.name,
@@ -490,7 +576,18 @@ FROM (
     ORDER BY order_count DESC, menu_id ASC
     LIMIT 3
 ) ranked;
-")
+"
+}
+
+popular_menus_match_mysql() {
+    local output_path="$1"
+    local api_path="$output_path/popular-menu-api.json"
+    local status expected_json
+
+    status=$(curl --silent --show-error --max-time 10 --output "$api_path" --write-out '%{http_code}' \
+        "$BASE_URL/api/v1/menus/popular" || true)
+    [[ "$status" == '200' ]] || return 1
+    expected_json=$(popular_menu_expected_json)
     jq -e --argjson expected "$expected_json" '.code == "SUCCESS" and .data == $expected' "$api_path" >/dev/null
 }
 
@@ -556,18 +653,28 @@ add_bottleneck_candidates() {
 wait_for_recovery() {
     local observation_path="$1"
     local log_since="$2"
-    local deadline=$(( $(date +%s) + RECOVERY_TIMEOUT_SECONDS ))
-    local observation
+    local deadline_epoch="$3"
+    local observation now remaining_seconds sleep_seconds
 
-    while (( $(date +%s) < deadline )); do
+    while true; do
         add_observation "$observation_path" "$log_since"
         observation=$(tail -n 1 "$observation_path")
         if jq -e '.pending.count == 0 and .kafkaLag.totalLag == 0' <<<"$observation" >/dev/null; then
+            RECOVERY_OBSERVED_AT=$(utc_now)
             return 0
         fi
-        sleep "$OBSERVATION_INTERVAL_SECONDS"
+
+        now=$(date +%s)
+        if (( now >= deadline_epoch )); then
+            return 1
+        fi
+        remaining_seconds=$(( deadline_epoch - now ))
+        sleep_seconds=$OBSERVATION_INTERVAL_SECONDS
+        if (( remaining_seconds < sleep_seconds )); then
+            sleep_seconds=$remaining_seconds
+        fi
+        sleep "$sleep_seconds"
     done
-    return 1
 }
 
 write_run_report() {
@@ -585,7 +692,14 @@ write_run_report() {
     local summary_hash="${12}"
     local metrics_hash="${13}"
     local report_path="$output_path/report.md"
-    local index status
+    local index status service_name data_preparation
+
+    if [[ "$scenario_name" == redis-* ]]; then
+        data_preparation="전용 Compose의 load-* 포인트 계정을 $SEED_BALANCE point로 생성하고, 주문·Outbox를 비운 뒤"
+        data_preparation+=' MySQL 원본 집계용 고정 주문과 Redis를 초기화함'
+    else
+        data_preparation="전용 Compose의 load-* 포인트 계정을 $SEED_BALANCE point로 생성하고, 주문·Outbox와 Redis를 초기화함"
+    fi
 
     cat >"$report_path" <<EOF
 # 부하 테스트 실행 보고서
@@ -598,9 +712,23 @@ write_run_report() {
 | 시나리오 | $scenario_name |
 | Git commit | $commit |
 | k6 버전 | $k6_version |
+| Docker Engine 버전 | $DOCKER_ENGINE_VERSION |
+| Docker Compose 버전 | $DOCKER_COMPOSE_VERSION |
 | 요청 주소 | $BASE_URL |
-| 데이터 준비 | 전용 Compose의 \`load-*\` 포인트 계정을 $SEED_BALANCE point로 생성하고, 주문·Outbox를 비운 뒤 Redis를 초기화함 |
+| 데이터 준비 | $data_preparation |
 | 실행 명령 | \`./scripts/load-test/invoke-load-test.sh --scenario $scenario_name\` |
+
+## 컨테이너 이미지
+
+| 서비스 | 이미지 참조 | 이미지 ID |
+| --- | --- | --- |
+EOF
+    for service_name in "${ENVIRONMENT_SERVICES[@]}"; do
+        printf '| %s | %s | %s |\n' "$service_name" "${ENVIRONMENT_IMAGE_REFERENCES[$service_name]}" \
+            "${ENVIRONMENT_IMAGE_IDS[$service_name]}" >>"$report_path"
+    done
+
+    cat >>"$report_path" <<EOF
 
 ## 장애 주입 시각
 
@@ -714,11 +842,15 @@ run_scenario() {
     local last_order_id last_outbox_event_id run_id output_path observation_path started_at started_epoch
     local summary_path metrics_path k6_exit_code recovered requests requests_per_second p50 p95 p99 failed_rate
     local successful_orders actual_order_count actual_outbox_count published_outbox_count
-    local initial_failures retry_failures
+    local initial_failures retry_failures recovery_deadline_epoch recovery_detail
+    local expected_popular_menus fault_window_popular_responses fault_window_popular_violations
     local balance_matches=true order_amount_matches=true popular_matches=false passed=true user_id expected_balance
     local charge_amount order_amount expected_count expected_amount actual_balance summary_hash metrics_hash
 
     reset_load_test_data
+    if [[ "$scenario_name" == redis-* ]]; then
+        seed_redis_popular_menu_data
+    fi
     load_baseline_balances
     last_order_id=$(mysql_scalar 'SELECT COALESCE(MAX(id), 0) FROM orders;')
     last_outbox_event_id=$(mysql_scalar 'SELECT COALESCE(MAX(id), 0) FROM outbox_events;')
@@ -750,11 +882,27 @@ run_scenario() {
 
     FAULT_STATE=([stopped]=false [restored]=false [injected]=false)
     FAULT_EVENTS=()
+    FAULT_RECOVERY_AT=''
+    RECOVERY_DEADLINE_EPOCH=0
+    RECOVERY_OBSERVED_AT=''
+    KAFKA_FAULT_STARTED_AT=''
+    KAFKA_BASELINE_CAPTURED=false
+    KAFKA_BASELINE_PENDING=0
+    KAFKA_BASELINE_LAG=0
+    KAFKA_MAX_PENDING=0
+    KAFKA_MAX_LAG=0
     VALIDATION_NAMES=()
     VALIDATION_PASSES=()
     VALIDATION_DETAILS=()
     started_at=$(utc_now)
     started_epoch=$(date +%s)
+    if [[ "$scenario_name" == redis-* ]]; then
+        expected_popular_menus=$(popular_menu_expected_json)
+        user_environment+=(
+            -e "EXPECTED_POPULAR_MENUS_JSON=$expected_popular_menus"
+            -e "POPULAR_MENU_FAULT_START_EPOCH_SECONDS=$(( started_epoch + 60 ))"
+        )
+    fi
     add_observation "$observation_path" "$started_at"
     start_k6_run "$script_name" "$run_id" "$output_path" \
         -e K6_BASE_URL=http://load-balancer:8080 \
@@ -777,10 +925,17 @@ run_scenario() {
 
     [[ $k6_exit_code -eq 0 ]] || fail "k6 실행이 실패했습니다. 로그: $output_path/k6.log"
 
-    if wait_for_recovery "$observation_path" "$started_at"; then
+    recovery_deadline_epoch=$RECOVERY_DEADLINE_EPOCH
+    if (( recovery_deadline_epoch == 0 )); then
+        recovery_deadline_epoch=$(( $(date +%s) + RECOVERY_TIMEOUT_SECONDS ))
+    fi
+    if wait_for_recovery "$observation_path" "$started_at" "$recovery_deadline_epoch"; then
         recovered=true
     else
         recovered=false
+    fi
+    if [[ "$scenario_name" == 'kafka-recovery' ]]; then
+        load_kafka_fault_maxima "$observation_path"
     fi
 
     summary_path="$output_path/summary.json"
@@ -793,6 +948,10 @@ run_scenario() {
     p99=$(summary_value "$summary_path" '.metrics.http_req_duration.values["p(99)"]')
     failed_rate=$(summary_value "$summary_path" '.metrics.http_req_failed.values.rate')
     successful_orders=$(summary_value "$summary_path" '.metrics.successful_orders.values.count')
+    fault_window_popular_responses=$(summary_value "$summary_path" \
+        '.metrics.fault_window_popular_responses.values.count')
+    fault_window_popular_violations=$(summary_value "$summary_path" \
+        '.metrics.fault_window_popular_response_violations.values.count')
     actual_order_count=$(mysql_scalar "SELECT COUNT(*) FROM orders WHERE id > $last_order_id;")
     actual_outbox_count=$(mysql_scalar "SELECT COUNT(*) FROM outbox_events WHERE id > $last_outbox_event_id;")
     published_outbox_count=$(mysql_scalar "
@@ -831,8 +990,12 @@ WHERE id > $last_outbox_event_id
         add_validation '모든 새 Outbox가 PUBLISHED' false \
             "published=$published_outbox_count, outbox=$actual_outbox_count"
     fi
-    add_validation 'PENDING과 consumer lag 5분 내 해소' "$recovered" \
-        "최대 대기=$RECOVERY_TIMEOUT_SECONDS 초"
+    if [[ -n "$FAULT_RECOVERY_AT" ]]; then
+        recovery_detail="복구=$FAULT_RECOVERY_AT, 기한 epoch=$recovery_deadline_epoch, 관측=$RECOVERY_OBSERVED_AT"
+    else
+        recovery_detail="기한 epoch=$recovery_deadline_epoch, 관측=$RECOVERY_OBSERVED_AT"
+    fi
+    add_validation 'PENDING과 consumer lag 기한 내 해소' "$recovered" "$recovery_detail"
 
     while IFS=$'\t' read -r user_id actual_balance; do
         [[ -n "$user_id" ]] || continue
@@ -871,7 +1034,45 @@ ORDER BY user_id;
     add_validation '인기 메뉴 API와 MySQL Top 3 일치' "$popular_matches" \
         'lag 0 이후 최근 7개 UTC 날짜 집계와 대조'
 
+    if [[ "$scenario_name" == redis-* ]]; then
+        if [[ $fault_window_popular_responses -gt 0 ]]; then
+            add_validation 'Redis 장애·복구 구간 인기 메뉴 응답 수집' true \
+                "count=$fault_window_popular_responses"
+        else
+            add_validation 'Redis 장애·복구 구간 인기 메뉴 응답 수집' false \
+                "count=$fault_window_popular_responses"
+        fi
+        if [[ $fault_window_popular_violations -eq 0 ]]; then
+            add_validation 'Redis 장애·복구 구간 인기 메뉴 응답과 MySQL 원본 일치' true \
+                "violations=$fault_window_popular_violations"
+        else
+            add_validation 'Redis 장애·복구 구간 인기 메뉴 응답과 MySQL 원본 일치' false \
+                "violations=$fault_window_popular_violations"
+        fi
+    fi
+
     if [[ "$scenario_name" == 'kafka-recovery' ]]; then
+        if [[ "$KAFKA_BASELINE_CAPTURED" == true ]]; then
+            add_validation 'Kafka 장애 전 PENDING과 consumer lag 기준 관측' true \
+                "pending=$KAFKA_BASELINE_PENDING, lag=$KAFKA_BASELINE_LAG"
+        else
+            add_validation 'Kafka 장애 전 PENDING과 consumer lag 기준 관측' false \
+                'Kafka broker 중단 전 consumer lag를 읽지 못함'
+        fi
+        if [[ "$KAFKA_BASELINE_CAPTURED" == true && $KAFKA_MAX_PENDING -gt $KAFKA_BASELINE_PENDING ]]; then
+            add_validation 'Kafka 장애 중 PENDING 증가 확인' true \
+                "baseline=$KAFKA_BASELINE_PENDING, maximum=$KAFKA_MAX_PENDING"
+        else
+            add_validation 'Kafka 장애 중 PENDING 증가 확인' false \
+                "baseline=$KAFKA_BASELINE_PENDING, maximum=$KAFKA_MAX_PENDING"
+        fi
+        if [[ "$KAFKA_BASELINE_CAPTURED" == true && $KAFKA_MAX_LAG -gt $KAFKA_BASELINE_LAG ]]; then
+            add_validation 'Kafka 장애 중 consumer lag 증가 확인' true \
+                "baseline=$KAFKA_BASELINE_LAG, maximum=$KAFKA_MAX_LAG"
+        else
+            add_validation 'Kafka 장애 중 consumer lag 증가 확인' false \
+                "baseline=$KAFKA_BASELINE_LAG, maximum=$KAFKA_MAX_LAG"
+        fi
         if [[ $initial_failures -gt 0 ]]; then
             add_validation 'Kafka 장애 중 최초 발행 실패 로그 확인' true "count=$initial_failures"
         else

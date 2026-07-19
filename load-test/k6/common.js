@@ -11,6 +11,12 @@ const successfulOrderPaidAmounts = new Counter('successful_order_paid_amounts');
 const successfulCharges = new Counter('successful_charges');
 const successfulChargeAmounts = new Counter('successful_charge_amounts');
 const successfulPopularReads = new Counter('successful_popular_reads');
+const faultWindowPopularResponses = new Counter('fault_window_popular_responses');
+const faultWindowPopularResponseViolations = new Counter('fault_window_popular_response_violations');
+const expectedPopularMenus = __ENV.EXPECTED_POPULAR_MENUS_JSON
+    ? JSON.parse(__ENV.EXPECTED_POPULAR_MENUS_JSON)
+    : null;
+const popularMenuFaultStartEpochSeconds = Number(__ENV.POPULAR_MENU_FAULT_START_EPOCH_SECONDS || 0);
 
 export function userForVirtualUser(prefix, count) {
     const userNumber = ((__VU - 1) % count) + 1;
@@ -54,6 +60,12 @@ export function findPopularMenus() {
     const success = check(response, {
         '인기 메뉴 조회가 200과 SUCCESS를 반환한다': (result) => isSuccessful(result, 200),
     });
+    if (isInPopularMenuFaultWindow()) {
+        faultWindowPopularResponses.add(1);
+        if (!popularMenuResponseMatchesExpected(response)) {
+            faultWindowPopularResponseViolations.add(1);
+        }
+    }
 
     if (success) {
         successfulPopularReads.add(1);
@@ -78,6 +90,25 @@ function isSuccessful(response, expectedStatus) {
 
     try {
         return response.json('code') === 'SUCCESS';
+    } catch (error) {
+        return false;
+    }
+}
+
+function isInPopularMenuFaultWindow() {
+    return popularMenuFaultStartEpochSeconds > 0 && Date.now() / 1000 >= popularMenuFaultStartEpochSeconds;
+}
+
+function popularMenuResponseMatchesExpected(response) {
+    if (!isSuccessful(response, 200)) {
+        return false;
+    }
+    if (expectedPopularMenus === null) {
+        return true;
+    }
+
+    try {
+        return JSON.stringify(response.json('data')) === JSON.stringify(expectedPopularMenus);
     } catch (error) {
         return false;
     }
