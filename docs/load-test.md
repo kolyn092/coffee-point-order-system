@@ -13,7 +13,7 @@
 
 - Docker Desktop과 Docker Compose v2
 - Bash 4.3 이상(Git Bash, WSL 또는 Linux/macOS)
-- `curl`, `jq`, `sha256sum`
+- `curl`, `jq`
 - 약 1시간 이상의 실행 시간과 Docker 이미지·Gradle 의존성을 내려받을 네트워크
 
 실행 스크립트는 처음에 전용 Compose를 `down --volumes`한 뒤 다시 올리고, 각 실행 전에는 `load-*` 포인트 계정,
@@ -70,7 +70,8 @@ bash ./scripts/load-test/invoke-load-test.sh --scenario consumer-scaling
 
 ## 수집·판정
 
-실행 중 5초마다 다음 데이터를 `observations.ndjson`에 남긴다.
+실행 중 5초마다 다음 데이터를 JSON 중간 산출물인 `observations.ndjson`에 기록한다. 실행이 끝나면 이 파일은
+정리하고, 필요한 원본 측정값과 판정 근거는 최종 Markdown 보고서에 옮긴다.
 
 - 각 컨테이너의 CPU·메모리 사용량
 - Outbox `PENDING` 개수와 가장 오래된 생성 시각
@@ -107,21 +108,25 @@ Redis 연결 장애·데이터 유실 시나리오는 장애 주입부터 k6 종
 
 ## 결과 확인
 
-각 실행은 다음 위치에 생성된다. 결과는 머신별로 달라서 Git에서 제외한다.
+각 시나리오의 실행이 끝나면 다음 최종 결과만 남긴다. 결과는 머신별로 달라서 Git에서 제외한다.
 
 ```text
-docs/load-test/results/<UTC-실행식별자>/summary.json
-docs/load-test/results/<UTC-실행식별자>/metrics.json
-docs/load-test/results/<UTC-실행식별자>/observations.ndjson
-docs/load-test/results/<UTC-실행식별자>/report.md
+docs/load-test/results/<UTC-실행식별자>-<시나리오>/report.md
 ```
 
-`summary.json`은 k6 원본 요약이며, `metrics.json`은 사용자별 성공 충전·주문 금액과 혼합 흐름 단계 지표를 재계산하는
-원본이다. `report.md`에는 Git commit, k6·Docker Engine·Docker Compose 버전, 각 컨테이너의 이미지 참조와 이미지 ID,
-데이터 준비, 장애 주입·복구 시각, 검증 판정, 병목 후보와 두 JSON 파일의 SHA-256을 남긴다. Consumer Group 확장
-보고서는 설정·활성 Consumer 수, Consumer별 파티션 할당, k6 종료 후 lag 0 도달 시간, 종단간 완료 시간과 종단간
-처리량도 남긴다. 세 번의 실행이 끝나면 같은 결과 루트에 시나리오별 중앙값·최댓값 집계 보고서가 생성되고, Consumer
-Group 확장은 1·2·3 Consumer 결과를 한 표에서 비교한 중앙 보고서도 생성된다.
+`summary.json`, `metrics.json`, `observations.ndjson`, k6 로그와 API 대조 응답은 실행 중 집계·검증에만 사용하고 실행
+종료 후 정리한다. `report.md`에는 Git commit, k6·Docker Engine·Docker Compose 버전, 각 컨테이너의 이미지 참조와
+이미지 ID, 데이터 준비, 장애 주입·복구 시각, k6 원본 측정값, 검증 판정과 병목 후보를 남긴다. Consumer Group 확장
+보고서는 Consumer 수 1·2·3별 세 번의 실행값과 중앙값·최댓값, 요청 완료율, 설정·활성 Consumer 수를 남긴다.
+Consumer별 파티션 할당, 최대·최종 Kafka lag, k6 종료 후 lag 0 도달 시간, 종단간 완료 시간·처리량과
+각 정합성 판정 근거를
+하나의 보고서에서 확인할 수 있어야 한다.
 
-결과를 재현할 때는 `report.md`의 commit, 실행 명령, Docker·Compose·k6 버전, 이미지 ID와 SHA-256이 같은지 먼저
-확인한다. 장비가 고정되지 않으므로 절대 p95 SLA는 이 문서에서 채택하지 않는다.
+결과를 재현할 때는 `report.md`의 commit, 실행 명령, Docker·Compose·k6 버전과 이미지 ID가 같은지 먼저 확인한다.
+장비가 고정되지 않으므로 절대 p95 SLA는 이 문서에서 채택하지 않는다.
+
+보고서 생성과 중간 산출물 정리 동작은 Docker 없이 다음 명령으로 검증한다.
+
+```bash
+bash ./scripts/load-test/test-invoke-load-test.sh
+```

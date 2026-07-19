@@ -237,11 +237,12 @@ API 요청·응답과 오류는 `docs/API.md`, 데이터 모델과 DB 제약은 
 - Consumer Group 확장의 종단간 완료 시간은 k6 시작부터 새 `PENDING = 0`과 consumer lag `= 0`을 처음 관측할 때까지이며,
   종단간 처리량은 성공 주문 수를 이 시간으로 나눈 값이다. 이 두 지표에는 HTTP·Outbox 발행 시간이 포함된다. 별도로
   k6 종료부터 같은 안정 상태까지의 lag 0 도달 시간을 기록해 Consumer가 부하 종료 뒤 처리한 잔여 시간을 구분한다.
-- 실행마다 `docs/load-test/results/<UTC-실행식별자>/summary.json`에 k6 원본 요약을, 같은 경로의 `report.md`에
-  환경·이미지·k6 버전·commit, 실행 명령, 데이터 준비·장애 주입 시각, 시나리오별 지표, 판정과 병목 후보를 기록한다.
-  `report.md`는 원본 JSON의 파일명과 SHA-256도 포함해 결과를 재현 가능하게 연결한다.
+- 실행 중 생성하는 k6 JSON·관측 NDJSON·로그는 집계용 중간 산출물로만 사용하고, 종료 시 정리한다. 최종 결과 경로는
+  `docs/load-test/results/<UTC-실행식별자>-<시나리오>/report.md` 하나다. 보고서만으로 환경·이미지·k6 버전·commit과
+  실행 명령, 데이터 준비·장애 주입 시각, 원본 측정값, 시나리오별 판정과 병목 후보를 확인할 수 있어야 한다.
 - 부하 테스트 구현은 k6 스크립트, 2개 애플리케이션·로드밸런서 Compose 구성, 5초 관측 수집과 결과 생성 자동화를
-  사용한다. Consumer Group 확장 결과는 Consumer 수별 보고서와 중앙 비교 보고서로 남긴다. 대시보드와 알림은 이
+  사용한다. Consumer Group 확장 결과는 1·2·3 Consumer의 세 번 반복 측정과 처리량·완료율·Kafka lag,
+  Consumer별 파티션 할당, 정합성 판정 근거를 단일 Markdown 보고서에 남긴다. 대시보드와 알림은 이
   단계에 추가하지 않는다. 단, 개발용 `docker-compose.yml`에는 `order.completed` 토픽과 `popular-menu` Consumer
   Group을 수동으로 진단하기 위한 Kafka UI를 추가할 수 있다. Kafka UI는 `127.0.0.1`에만 바인딩하고, 부하 테스트
   Compose·운영 배포·인증·인가·알림·애플리케이션 이벤트 계약에는 포함하지 않는다.
